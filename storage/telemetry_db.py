@@ -211,6 +211,10 @@ class LumenStorageManager:
         git_hash: str = "v5.0-dev",
         approved_for_training: bool = False,
     ) -> None:
+        if source_type not in {"baseline_lab", "live_validated"}:
+            raise ValueError("unsupported session source_type")
+        if source_type == "live_validated" and approved_for_training:
+            raise ValueError("live_validated sessions cannot be approved for training")
         now_ns = time.time_ns()
         cfg_json = json.dumps(config, sort_keys=True)
 
@@ -233,7 +237,11 @@ class LumenStorageManager:
             conn.execute(
                 """
                 UPDATE baseline_sessions
-                SET ended_at_ns = ?, approved_for_training = ?
+                SET ended_at_ns = ?,
+                    approved_for_training = CASE
+                        WHEN source_type = 'baseline_lab' AND ? = 1 THEN 1
+                        ELSE 0
+                    END
                 WHERE session_id = ?
                 """,
                 (now_ns, 1 if approved_for_training else 0, session_id),
@@ -316,13 +324,86 @@ class LumenStorageManager:
                     cert_fingerprint = excluded.cert_fingerprint,
                     device_role = excluded.device_role,
                     criticality = excluded.criticality,
-                    current_state = excluded.current_state,
+                    current_state = CASE
+                        WHEN device_registry.current_state <> 'ACTIVE' THEN device_registry.current_state
+                        ELSE excluded.current_state
+                    END,
                     updated_at_ns = excluded.updated_at_ns
                 """,
                 (device_id, generation, device_cn, cert_fingerprint, device_role, criticality, state, now_ns),
             )
 
         self._writers["control"].submit_sync(_op)
+
+    def load_device_state_rows(self) -> dict[str, dict[str, Any]]:
+        """Return the latest generation and authoritative state per stable identity."""
+        conn = self.connect_readonly("control")
+        try:
+            rows = conn.execute(
+                "SELECT device_id, generation, current_state FROM device_registry ORDER BY generation ASC"
+            ).fetchall()
+            return {
+                str(row["device_id"]): {
+                    "generation": int(row["generation"]),
+                    "current_state": str(row["current_state"]),
+                }
+                for row in rows
+            }
+        finally:
+            conn.close()
+
+    def load_device_states(self) -> dict[str, str]:
+        """Return the latest persisted registry state for each stable device identity."""
+        return {device_id: row["current_state"] for device_id, row in self.load_device_state_rows().items()}
+
+    def save_policy_state(
+        self, device_id: str, generation: int, current_state: str,
+        anomaly_history: list[int] | tuple[int, ...], clean_streak: int,
+    ) -> None:
+        """Persist policy state/hysteresis atomically for restart restoration."""
+        if generation < 1 or clean_streak < 0:
+            raise ValueError("invalid generation or clean_streak")
+        history_json = json.dumps([int(v) for v in anomaly_history], separators=(",", ":"))
+        updated_at_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """INSERT INTO policy_state
+                   (device_id, generation, current_state, anomaly_history_json, clean_streak, updated_at_ns)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(device_id) DO UPDATE SET
+                     generation=excluded.generation, current_state=excluded.current_state,
+                     anomaly_history_json=excluded.anomaly_history_json,
+                     clean_streak=excluded.clean_streak, updated_at_ns=excluded.updated_at_ns""",
+                (device_id, generation, current_state, history_json, clean_streak, updated_at_ns),
+            )
+
+        self._writers["control"].submit_sync(_op)
+
+    def load_policy_states(self) -> dict[str, dict[str, Any]]:
+        """Load persisted policy states, including anomaly history and clean streak."""
+        conn = self.connect_readonly("control")
+        try:
+            rows = conn.execute(
+                "SELECT device_id, generation, current_state, anomaly_history_json, clean_streak FROM policy_state"
+            ).fetchall()
+            restored: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                try:
+                    history = json.loads(row["anomaly_history_json"])
+                    if not isinstance(history, list) or any(v not in (0, 1) for v in history):
+                        continue
+                    restored[str(row["device_id"])] = {
+                        "generation": int(row["generation"]),
+                        "current_state": str(row["current_state"]),
+                        "anomaly_history": [int(v) for v in history],
+                        "clean_streak": max(0, int(row["clean_streak"])),
+                    }
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            return restored
+        finally:
+            conn.close()
 
     def consume_nonce_atomic(self, device_id: str, generation: int, nonce: str) -> bool:
         """Consumă atomic un nonce. Returnează False dacă este replay (deja văzut)."""

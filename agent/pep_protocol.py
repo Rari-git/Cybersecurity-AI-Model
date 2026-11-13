@@ -51,6 +51,8 @@ class PepAckRegistry:
                 return False
             if ack.result not in {"CONFIRMED", "FAILED"} or ack.timestamp_ns <= 0 or not ack.gateway_instance_id:
                 return False
+            if ack.result == "CONFIRMED" and ack.applied_action != ack.requested_action:
+                return False
             item["ack"] = ack
             item["event"].set()
             return True

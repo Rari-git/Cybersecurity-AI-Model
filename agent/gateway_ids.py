@@ -28,20 +28,26 @@ except (ValueError, ImportError) as exc:
     logger.critical("[GATEWAY IDS] Crypto initialization failed; refusing to start: %s", exc)
     raise SystemExit(1) from exc
 
-from training.feature_extractor import TOPIC_MAP, payload_plausible
+from training.feature_extractor import TOPIC_MAP
 from agent.enforcement import EnforcementEngine, sanitize, ALERT_TOPIC
 from agent.forensic_sink import ForensicQuarantineSink
+from agent.pep_protocol import PepAcknowledgement
 from storage.telemetry_db import LumenStorageManager, DBPaths
+from storage.admission_gate import AdmissionGate, ProvenanceContext
 from utils.rate_limit import TokenBucketRateLimiter
 from utils.mtls_hot_reload import open_mtls_client
 from utils.cert_lifecycle import revoke_active_certificate
 from utils.device_registry import DeviceRegistry
 from utils.device_security import DeviceSecurityManager
+from utils.device_identity import load_active_device_identity
+from utils.identity_envelope import IdentityEnvelope
 from utils.key_lifecycle import KeyHealthMonitor, RevocationLedger
 
 MAX_PAYLOAD_BYTES = 512
 INGEST_PREFIX = "ingest/"
 POLICY_CONTROL_TOPIC = "control/policy/**"
+INTERNAL_TELEMETRY_PREFIX = "internal/ids/telemetry/"
+PEP_ACK_PREFIX = "control/pep_ack/"
 SAFE_DEVICE_ID_RE = re.compile(r"^[a-zA-Z0-9_]{1,64}$")
 
 ALLOWED_COMMAND_TOPICS = frozenset(
@@ -91,6 +97,23 @@ class ZenohInlineGateway:
             paths=DBPaths.from_dir(os.environ.get("LUMEN_DB_DIR", "logs/db")),
             enable_writers=True,
         )
+        self.cert_pointer = os.environ.get("LUMEN_CERT_POINTER")
+        if not self.cert_pointer:
+            raise RuntimeError("LUMEN_CERT_POINTER is required for authenticated Gateway-to-IDS envelopes")
+        allowed_topics = {spec.device_id: {spec.target_topic} for spec in self.registry.enabled_devices()}
+        self.admission_gate = AdmissionGate(self.storage, allowed_topics)
+        self.storage.register_baseline_session(
+            session_id=self.run_id,
+            source_type="live_validated",
+            config={"gateway_instance_id": self.run_id, "approved_for_training": False},
+            git_hash=os.environ.get("LUMEN_GIT_HASH", "v5.0-runtime"),
+            approved_for_training=False,
+        )
+        # Restore fail-closed blocks before accepting any new sensor ingress.
+        for device_id, state in self.storage.load_device_states().items():
+            if state in {"SHADOW_QUARANTINE", "RECOVERY_PENDING", "ENFORCEMENT_PENDING", "ENFORCEMENT_FAILED", "QUARANTINED", "REVOKED"}:
+                self._shadow_quarantined.add(device_id)
+                self.admission_gate.set_device_blocked(device_id, True)
         self.forensic_sink = ForensicQuarantineSink(storage=self.storage)
 
         self.topic_rate_limiter = TokenBucketRateLimiter(
@@ -169,6 +192,8 @@ class ZenohInlineGateway:
             else:
                 self._shadow_quarantined.discard(device_id)
             confirmed = (device_id in self._shadow_quarantined) == enabled
+        if hasattr(self, "admission_gate"):
+            self.admission_gate.set_device_blocked(device_id, enabled)
         self._inc("shadow_quarantine_transitions")
         logger.warning(
             "[PEP STATE] device=%s shadow_quarantine=%s confirmed=%s",
@@ -183,36 +208,65 @@ class ZenohInlineGateway:
             return device_id in self._shadow_quarantined
 
     def _on_policy_command(self, sample) -> None:
-        """Primește decizii de la Policy Engine pe control/policy/<device_id> și trimite ACK PEP."""
+        """Apply PEP commands and publish a correlated ACK only after the state change."""
         key = str(sample.key_expr)
         parts = key.split("/")
         if len(parts) != 3 or parts[0] != "control" or parts[1] != "policy":
             return
         device_id = parts[2]
+        decision_id = ""
         try:
             raw = sample.payload.to_bytes() if hasattr(sample.payload, "to_bytes") else bytes(sample.payload)
             cmd = json.loads(raw.decode("utf-8"))
             target_state = str(cmd.get("target_state", "")).upper()
             decision_id = str(cmd.get("decision_id", ""))
+            if cmd.get("device_id") != device_id or not decision_id:
+                raise ValueError("PEP command device/decision correlation is missing or mismatched")
+            if target_state not in {"SHADOW_QUARANTINE", "ACTIVE"}:
+                raise ValueError("unsupported PEP target state")
             enable = target_state == "SHADOW_QUARANTINE"
             ok = self.set_shadow_quarantine(device_id, enable)
-            if decision_id:
-                self.storage.confirm_enforcement_pep(
-                    decision_id,
-                    confirmed=ok,
-                    detail=f"gateway_pep:{target_state}",
-                )
+            ack = PepAcknowledgement(
+                decision_id=decision_id,
+                device_id=device_id,
+                requested_action=target_state,
+                applied_action=target_state if ok else ("SHADOW_QUARANTINE" if self.is_shadow_quarantined(device_id) else "ACTIVE"),
+                result="CONFIRMED" if ok else "FAILED",
+                timestamp_ns=time.time_ns(),
+                gateway_instance_id=self.run_id,
+            )
+            self.session.put(
+                f"{PEP_ACK_PREFIX}{decision_id}",
+                json.dumps({
+                    "decision_id": ack.decision_id, "device_id": ack.device_id,
+                    "requested_action": ack.requested_action, "applied_action": ack.applied_action,
+                    "result": ack.result, "timestamp_ns": ack.timestamp_ns,
+                    "gateway_instance_id": ack.gateway_instance_id,
+                }, separators=(",", ":")).encode("utf-8"),
+            )
         except Exception:
+            # A lost ACK must never leave the device released while IDS believes
+            # the release is unconfirmed. Roll back release requests fail-closed.
+            if decision_id and locals().get("target_state") == "ACTIVE":
+                try:
+                    self.set_shadow_quarantine(device_id, True)
+                except Exception:
+                    logger.critical("[PEP ROLLBACK] failed to restore quarantine for %s",
+                                    sanitize(device_id, 64), exc_info=True)
             self._inc("callback_errors")
-            logger.exception("[PEP POLICY CMD] Failed to apply policy command for %s", sanitize(device_id, 64))
+            logger.exception("[PEP POLICY CMD] Failed to apply/ack policy command for %s", sanitize(device_id, 64))
 
     def _route_to_shadow_sandbox(self, device_id: str, target_topic: str, raw: bytes) -> None:
-        """Redirecționează fluxul carantinat către shadow/sandbox/<device_id>/data fără a polua home/**."""
+        """Persist and optionally publish quarantined telemetry using real PKI metadata."""
         if not SAFE_DEVICE_ID_RE.match(device_id):
             return
+        try:
+            identity = load_active_device_identity(self.cert_pointer, device_id)
+        except Exception:
+            logger.error("[SHADOW SINK] no valid active certificate identity for %s", sanitize(device_id, 64))
+            return
         envelope = {
-            "source_device": device_id,
-            "original_topic": target_topic,
+            "source_device": device_id, "original_topic": target_topic,
             "shadow_topic": f"shadow/sandbox/{device_id}/data",
             "gateway_received_at_ns": time.time_ns(),
             "payload_sha256": hashlib.sha256(raw).hexdigest(),
@@ -225,17 +279,10 @@ class ZenohInlineGateway:
         except Exception as exc:
             self._inc("publish_errors")
             logger.error("[SHADOW PUBLISH] device=%s error=%s", sanitize(device_id, 64), sanitize(exc))
-
-        fp = hashlib.sha256(device_id.encode("utf-8")).digest()
         self.forensic_sink.ingest_shadow_envelope(
-            session_id=self.run_id,
-            device_id=device_id,
-            device_cn=device_id,
-            generation=1,
-            cert_fingerprint=fp,
-            original_topic=target_topic,
-            raw_payload=raw,
-            risk_score=0.95,
+            session_id=self.run_id, device_id=device_id, device_cn=identity.common_name,
+            generation=identity.generation, cert_fingerprint=identity.certificate_fingerprint,
+            original_topic=target_topic, raw_payload=raw, risk_score=0.95,
             reason_code="SHADOW_QUARANTINE_ACTIVE",
         )
 
@@ -515,36 +562,38 @@ class ZenohInlineGateway:
         if self.is_shadow_quarantined(device_id):
             self._route_to_shadow_sandbox(device_id, target, raw)
             return
-        try:
-            payload_text = raw.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
+
+        identity = load_active_device_identity(self.cert_pointer, device_id)
+        spec = self.registry.get(device_id)
+        if spec is None or identity.common_name != spec.cert_cn and not identity.common_name.startswith(f"{device_id}-g"):
+            raise ValueError("active certificate identity is not bound to the registered sensor")
+        ctx = ProvenanceContext(
+            session_id=self.run_id, device_cn=identity.common_name,
+            cert_fingerprint=identity.certificate_fingerprint, source_type="live_validated",
+            device_id=device_id, generation=identity.generation,
+        )
+        # AdmissionGate persists admitted rows or rejected evidence synchronously.
+        # Any queue/SQLite failure propagates to the worker callback and fails closed.
+        admission = self.admission_gate.evaluate_and_ingest(ctx, target, raw)
+        if not admission.admitted:
             self._inc("sensor_invalid_dropped")
-            self._register_device_violation(
-                device_id, target, "Anomalous Payload", "payload is not valid UTF-8"
-            )
-            return
-        if not payload_plausible(target, payload_text):
-            self._inc("sensor_invalid_dropped")
-            self._register_device_violation(
-                device_id, target, "Anomalous Payload",
-                f"implausible payload: {sanitize(payload_text, 40)}",
-            )
-            return
-        if self.device_security.is_blocked(device_id):
-            self._inc("device_blocklist_dropped")
-            return
-        if self.is_shadow_quarantined(device_id):
-            self._route_to_shadow_sandbox(device_id, target, raw)
-            return
-        try:
+
+        # The router ACL grants internal envelope publication to the Gateway only.
+        # IDS verifies the envelope's claims against its independently read active PKI.
+        envelope = IdentityEnvelope.create(
+            device_id=device_id, generation=identity.generation,
+            certificate_common_name=identity.common_name,
+            certificate_fingerprint=identity.certificate_fingerprint,
+            original_topic=target, payload=raw, gateway_instance_id=self.run_id,
+        )
+        self.session.put(f"{INTERNAL_TELEMETRY_PREFIX}{device_id}", envelope.encode())
+
+        # Keep legacy canonical topics only for admitted sensor values.
+        if admission.admitted:
             self.session.put(target, raw)
             self._inc("sensor_forwarded")
             with self._stats_lock:
                 self.device_publish_accepted[device_id] = self.device_publish_accepted.get(device_id, 0) + 1
-        except Exception as exc:
-            self._inc("publish_errors")
-            logger.error("[GATEWAY PUBLISH] sensor target=%s device=%s error=%s",
-                         sanitize(target, 80), sanitize(device_id, 64), sanitize(exc))
 
     def _worker_loop(self) -> None:
         while self.running or not self.ingest_queue.empty() or not self.device_alert_queue.empty():

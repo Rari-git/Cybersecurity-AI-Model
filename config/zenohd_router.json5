@@ -29,6 +29,10 @@
       { id: "in_put_home_sensors",     messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/sensors/**"] },
       { id: "in_put_home_actuators",   messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
       { id: "in_put_alerts",           messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+      // E1: authenticated sensor identity envelopes are publishable only by Gateway.
+      { id: "in_put_internal_ids_telemetry", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["internal/ids/telemetry/**"] },
+      // E2: correlated PEP acknowledgements are publishable only by Gateway.
+      { id: "in_put_pep_ack", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
       { id: "in_put_policy_ctrl",      messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
       { id: "in_put_shadow_sandbox",   messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["shadow/sandbox/**"] },
 
@@ -37,6 +41,8 @@
       { id: "out_put_home",            messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/**"] },
       { id: "out_put_actuator_cmd",    messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/actuators/**"] },
       { id: "out_put_alerts",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/security/alerts"] },
+      { id: "out_put_internal_ids_telemetry", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["internal/ids/telemetry/**"] },
+      { id: "out_put_pep_ack", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
       { id: "out_put_policy_ctrl",     messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["control/policy/**"] },
       { id: "out_put_shadow_sandbox",  messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["shadow/sandbox/**"] },
 
@@ -45,6 +51,8 @@
       { id: "sub_home",                messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/**"] },
       { id: "sub_actuator_cmd",        messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
       { id: "sub_alerts",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+      { id: "sub_internal_ids_telemetry", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["internal/ids/telemetry/**"] },
+      { id: "sub_pep_ack", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
       { id: "sub_policy_ctrl",         messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
       { id: "sub_shadow_sandbox",      messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["shadow/sandbox/**"] },
 
@@ -85,7 +93,10 @@
           "in_put_shadow_sandbox", "sub_policy_ctrl", "out_put_policy_ctrl"
         ],
         subjects: ["gateway"] },
-      { rules: ["sub_home", "out_put_home", "sub_ingest", "out_put_ingest", "in_put_alerts", "in_put_policy_ctrl"],
+      { rules: ["in_put_internal_ids_telemetry", "in_put_pep_ack"], subjects: ["gateway"] },
+      { rules: ["sub_home", "out_put_home", "sub_ingest", "out_put_ingest", "in_put_alerts", "in_put_policy_ctrl",
+                "sub_internal_ids_telemetry", "out_put_internal_ids_telemetry",
+                "sub_pep_ack", "out_put_pep_ack"],
         subjects: ["ids"] },
       { rules: [
           "honeypot_declare", "honeypot_query_out", "honeypot_reply_in", "honeypot_reply_out",

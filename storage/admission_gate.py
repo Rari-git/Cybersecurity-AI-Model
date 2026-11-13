@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from storage.telemetry_db import LumenStorageManager
+from storage.persistence import persist_normal_event, persist_incident_capture
 
 MAX_RAW_PAYLOAD_BYTES = 512
 CN_PATTERN = re.compile(r"^([a-zA-Z0-9_]+)(?:-g(\d+)-[a-zA-Z0-9_]+)?$")
@@ -40,6 +41,8 @@ class ProvenanceContext:
     cert_fingerprint: bytes
     source_type: str  # 'baseline_lab' | 'live_validated'
     admission_policy_version: str = "v5.0-gate-1"
+    device_id: Optional[str] = None
+    generation: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,13 @@ class AdmissionGate:
         payload_sha = hashlib.sha256(raw_bytes).digest()
 
         try:
-            device_id, generation = parse_device_identity(ctx.device_cn)
+            parsed_device_id, parsed_generation = parse_device_identity(ctx.device_cn)
+            device_id = ctx.device_id or parsed_device_id
+            generation = ctx.generation if ctx.generation is not None else parsed_generation
+            if device_id != parsed_device_id:
+                raise ValueError("certificate CN does not match stable device_id")
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                raise ValueError("invalid certificate generation")
         except ValueError as exc:
             return AdmissionResult(False, "unknown", 0, str(exc))
 
@@ -165,7 +174,8 @@ class AdmissionGate:
             return AdmissionResult(False, device_id, generation, reason, numeric_value=num_val)
 
         # Admis în telemetry_normal.db
-        self.storage.enqueue_normal_raw_event(
+        persist_normal_event(
+            self.storage,
             (
                 ctx.session_id,
                 device_id,
@@ -198,7 +208,8 @@ class AdmissionGate:
         reason: str,
     ) -> None:
         retention_ns = gateway_ts_ns + 7 * 24 * 3600 * 1_000_000_000
-        self.storage.enqueue_incident_capture(
+        persist_incident_capture(
+            self.storage,
             (
                 ctx.session_id,
                 device_id,

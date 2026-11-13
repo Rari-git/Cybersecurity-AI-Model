@@ -38,6 +38,7 @@ from training.feature_extractor import (
 from agent.enforcement import EnforcementEngine, sanitize, ALERT_TOPIC
 from agent.statistical_detectors import TwoSidedCusumDetector, OperationalFaultClassifier
 from agent.policy_engine import RiskPolicyEngine, DetectionEvidence
+from agent.pep_protocol import PepAckRegistry, PepAcknowledgement
 from storage.telemetry_db import LumenStorageManager, DBPaths
 from models.bundle_loader import verify_and_load_bundle
 from utils.features_v5 import (
@@ -49,6 +50,10 @@ from utils.features_v5 import (
 from utils.xai_explainer import NormalizedXaiExplainer
 from utils.device_registry import DeviceRegistry
 from utils.device_identity import load_active_device_identity
+from utils.cert_lifecycle import CertRevocationLedger, revoke_active_certificate
+from utils.identity_envelope import (
+    IdentityEnvelope, validate_active_identity, validate_envelope_route,
+)
 from models.model_lifecycle import resolve_active_bundle
 from utils.crypto_utils import CommandSigner
 from utils.replay_store import ReplayStore
@@ -62,7 +67,9 @@ MAX_PAYLOAD_BYTES = 512
 ACTUATOR_BURST_STREAK = 4
 STATS_INTERVAL_SEC = 10.0
 RATE_ALERT_INTERVAL_SEC = 1.0
-IGNORED_PREFIXES = ("ingest/", "shadow/", "control/policy/")
+IGNORED_PREFIXES = ("ingest/", "shadow/", "control/policy/", "control/pep_ack/")
+INTERNAL_TELEMETRY_PREFIX = "internal/ids/telemetry/"
+PEP_ACK_PREFIX = "control/pep_ack/"
 FAIL_CLOSED_LOSS = 999.0
 
 LAB_EXTRA_COMMAND_TOPICS = frozenset({"home/actuators/garage/door"})
@@ -86,14 +93,16 @@ class ZenohIDSAgent:
         self.registry = DeviceRegistry.load(
             os.environ.get("LUMEN_DEVICE_REGISTRY", "config/devices.json")
         )
-        self._topic_to_device: dict[str, str] = {}
+        self._device_to_topic: dict[str, str] = {}
         self._device_criticality: dict[str, str] = {}
         for spec in self.registry.enabled_devices():
+            self._device_to_topic[spec.device_id] = spec.target_topic
             self._device_criticality[spec.device_id] = (
                 "safety_critical" if "gas" in spec.device_id else "normal"
             )
-            for t in getattr(spec, "allowed_topics", ()):
-                self._topic_to_device[t] = spec.device_id
+        self.cert_pointer = os.environ.get("LUMEN_CERT_POINTER")
+        if not self.cert_pointer:
+            raise RuntimeError("LUMEN_CERT_POINTER is required to validate Gateway identity envelopes")
 
         self.storage = LumenStorageManager(
             paths=DBPaths.from_dir(os.environ.get("LUMEN_DB_DIR", "logs/db")),
@@ -104,6 +113,12 @@ class ZenohIDSAgent:
             if not pointer:
                 raise RuntimeError("LUMEN_CERT_POINTER is required to bind devices to real certificates")
             identity = load_active_device_identity(pointer, spec.device_id)
+            initial_state = "ACTIVE"
+            ledger_path = os.environ.get("LUMEN_CERT_REVOCATIONS")
+            if ledger_path and CertRevocationLedger(ledger_path).is_revoked(
+                spec.device_id, identity.serial_number_hex
+            ):
+                initial_state = "REVOKED"
             self.storage.upsert_device(
                 device_id=spec.device_id,
                 generation=identity.generation,
@@ -111,7 +126,7 @@ class ZenohIDSAgent:
                 cert_fingerprint=identity.certificate_fingerprint,
                 device_role="sensor",
                 criticality=self._device_criticality[spec.device_id],
-                state="ACTIVE",
+                state=initial_state,
             )
 
         self.ml_enabled = False
@@ -161,7 +176,7 @@ class ZenohIDSAgent:
         self.wake = threading.Event()
         self._streak = 0
 
-        self.rate_limiter = TokenBucketRateLimiter(rate=30.0, burst=60.0, max_keys=len(KNOWN_TOPICS) + 1)
+        self.rate_limiter = TokenBucketRateLimiter(rate=30.0, burst=60.0, max_keys=max(1, len(self._device_to_topic) + len(KNOWN_TOPICS) + 1))
         self.unknown_limiter = TokenBucketRateLimiter(rate=5.0, burst=10.0, max_keys=1)
 
         self._meter_lock = threading.Lock()
@@ -190,13 +205,17 @@ class ZenohIDSAgent:
 
         self.session = open_mtls_client(os.environ.get("LUMEN_CERT_IDENTITY", "ids"))
         self.enforcement = EnforcementEngine(self.session)
+        self.pep_ack_registry = PepAckRegistry()
+        self.pep_ack_timeout_sec = float(os.environ.get("LUMEN_PEP_ACK_TIMEOUT_SEC", "2.0"))
         self.policy_engine = RiskPolicyEngine(
             storage=self.storage,
-            pep_apply_fn=self._dispatch_pep_policy,
+            pep_request_fn=self._dispatch_pep_policy,
+            revocation_fn=self._revoke_device_certificate,
             device_criticality=self._device_criticality,
             window_n=5,
             trigger_k=3,
             recovery_clean_windows=8,
+            fault_recovery_clean_windows=int(os.environ.get("LUMEN_FAULT_RECOVERY_CLEAN_WINDOWS", "8")),
         )
 
     def _load_verified_bundle(self, bundle_dir: Path, pub_key_path: Path) -> None:
@@ -239,19 +258,49 @@ class ZenohIDSAgent:
             self.global_threshold,
         )
 
-    def _resolve_device_id(self, topic: str) -> str:
-        if topic in self._topic_to_device:
-            return self._topic_to_device[topic]
-        # Fallback determinist pentru topicuri senzoriale standard
-        parts = topic.split("/")
-        if len(parts) >= 3 and parts[0] == "home" and parts[1] == "sensors":
-            return f"{parts[2]}_sensor_01"
-        return "unknown_device"
+    def _resolve_device_id(self, topic: str, device_id: str | None = None) -> str:
+        """Resolve only an envelope-bound stable ID; never infer from shared-topic suffixes."""
+        if not device_id or self._device_to_topic.get(device_id) != topic:
+            raise ValueError("sensor identity is missing or not authorized for this topic")
+        return device_id
 
-    def _dispatch_pep_policy(self, device_id: str, enable_quarantine: bool) -> bool:
-        """Trimite comanda de aplicare PEP către Inline Gateway pe control/policy/<device_id>."""
+    def _validate_identity_envelope(self, key: str, raw: bytes):
+        if len(raw) > 2048:
+            raise ValueError("internal telemetry envelope exceeds size limit")
+        env, payload = IdentityEnvelope.decode(raw)
+        validate_envelope_route(env, key, self._device_to_topic)
+        identity = load_active_device_identity(self.cert_pointer, env.device_id)
+        validate_active_identity(env, identity)
+        return env, payload
+
+    def _on_pep_ack(self, sample) -> None:
+        """Accept only a correctly correlated, first-seen Gateway PEP ACK."""
+        try:
+            key = str(sample.key_expr)
+            raw = sample.payload.to_bytes() if hasattr(sample.payload, "to_bytes") else bytes(sample.payload)
+            payload = json.loads(raw.decode("utf-8"))
+            ack = PepAcknowledgement(
+                decision_id=str(payload["decision_id"]),
+                device_id=str(payload["device_id"]),
+                requested_action=str(payload["requested_action"]),
+                applied_action=str(payload["applied_action"]),
+                result=str(payload["result"]),
+                timestamp_ns=int(payload["timestamp_ns"]),
+                gateway_instance_id=str(payload["gateway_instance_id"]),
+            )
+            if key != f"{PEP_ACK_PREFIX}{ack.decision_id}":
+                return
+            if not self.pep_ack_registry.accept(ack):
+                logger.warning("[PEP ACK REJECTED] decision=%s", sanitize(ack.decision_id, 48))
+        except Exception:
+            logger.exception("[PEP ACK] malformed acknowledgment rejected")
+
+    def _dispatch_pep_policy(self, device_id: str, enable_quarantine: bool, decision_id: str) -> bool:
+        """Publish a PEP command and wait for its exact correlated Gateway ACK."""
         target_state = "SHADOW_QUARANTINE" if enable_quarantine else "ACTIVE"
+        self.pep_ack_registry.register(decision_id, device_id, target_state)
         cmd = {
+            "decision_id": decision_id,
             "device_id": device_id,
             "target_state": target_state,
             "issued_at_unix": time.time(),
@@ -262,14 +311,29 @@ class ZenohIDSAgent:
                 f"control/policy/{device_id}",
                 json.dumps(cmd, separators=(",", ":")).encode("utf-8"),
             )
-            return True
         except Exception as exc:
-            logger.error(
-                "[PEP DISPATCH ERROR] device=%s target=%s err=%s",
-                sanitize(device_id, 64),
-                target_state,
-                sanitize(exc, 120),
-            )
+            self.pep_ack_registry.cancel(decision_id)
+            logger.error("[PEP DISPATCH ERROR] device=%s target=%s err=%s",
+                         sanitize(device_id, 64), target_state, sanitize(exc, 120))
+            return False
+        ack = self.pep_ack_registry.wait(decision_id, self.pep_ack_timeout_sec)
+        return bool(ack is not None and ack.confirmed and ack.device_id == device_id
+                    and ack.requested_action == target_state)
+
+    def _revoke_device_certificate(self, device_id: str, reason: str) -> bool:
+        """Revoke an active certificate and explicitly verify its serial in the ledger."""
+        pointer = self.cert_pointer
+        ledger_path = os.environ.get("LUMEN_CERT_REVOCATIONS")
+        if not pointer or not ledger_path:
+            logger.error("[CERT REVOCATION] pointer/ledger path is not configured")
+            return False
+        try:
+            identity = load_active_device_identity(pointer, device_id)
+            revoke_active_certificate(pointer, ledger_path, device_id, reason, quarantine_only=False)
+            return CertRevocationLedger(ledger_path).is_revoked(device_id, identity.serial_number_hex)
+        except Exception:
+            logger.exception("[CERT REVOCATION] failed or ledger verification did not complete for %s",
+                             sanitize(device_id, 64))
             return False
 
     def _publish_v5_alert(
@@ -328,10 +392,13 @@ class ZenohIDSAgent:
             return
         logger.debug("[CRYPTO OK] '%s'", sanitize(key, 80))
 
-    def _process_sensor(self, key: str, payload_str: str, delta_t: float, rate: float) -> None:
+    def _process_sensor(
+        self, key: str, payload_str: str, delta_t: float, rate: float,
+        device_id: str | None = None, generation: int = 1,
+    ) -> None:
         payload_str = truncate_payload(payload_str)
         raw_bytes = payload_str.encode("utf-8", errors="replace")
-        device_id = self._resolve_device_id(key)
+        device_id = self._resolve_device_id(key, device_id)
 
         flood = rule_flood(delta_t, rate)
         if flood:
@@ -394,7 +461,7 @@ class ZenohIDSAgent:
 
         evidence = DetectionEvidence(
             device_id=device_id,
-            generation=1,
+            generation=generation,
             topic=key,
             lstm_score=lstm_score,
             lstm_threshold=lstm_thr,
@@ -453,12 +520,12 @@ class ZenohIDSAgent:
                 severity="low",
             )
 
-    def _process_sample(self, key, payload_bytes, recv_time, delta_t, rate) -> None:
+    def _process_sample(self, key, payload_bytes, recv_time, delta_t, rate, device_id=None, generation=1) -> None:
         payload_str = payload_bytes.decode("utf-8", errors="replace")
         if key.startswith("home/actuators"):
             self._process_actuator(key, payload_str)
         else:
-            self._process_sensor(key, truncate_payload(payload_str), delta_t, rate)
+            self._process_sensor(key, truncate_payload(payload_str), delta_t, rate, device_id, generation)
 
     def _next_item(self):
         self.wake.clear()
@@ -498,54 +565,69 @@ class ZenohIDSAgent:
 
     def _on_sample(self, sample) -> None:
         key = str(sample.key_expr)
-
-        if key == ALERT_TOPIC:
+        if key == ALERT_TOPIC or key.startswith(PEP_ACK_PREFIX):
             return
-        now = time.monotonic()
+        if key.startswith(INTERNAL_TELEMETRY_PREFIX):
+            now = time.monotonic()
+            try:
+                raw = sample.payload.to_bytes() if hasattr(sample.payload, "to_bytes") else bytes(sample.payload)
+                env, payload = self._validate_identity_envelope(key, raw)
+            except Exception as exc:
+                self.stats["unknown"] += 1
+                logger.warning("[IDENTITY ENVELOPE REJECTED] key=%s reason=%s",
+                               sanitize(key, 100), sanitize(exc, 160))
+                return
+            stream_key = f"{env.device_id}::{env.original_topic}"
+            with self._meter_lock:
+                meter = self.meters.get(stream_key)
+                if meter is None:
+                    meter = self.meters[stream_key] = RateMeter(now)
+                delta_t, rate = meter.observe(now)
+            if not self.rate_limiter.allow(stream_key, now):
+                self.stats["rate"] += 1
+                return
+            if len(payload) == 0 or len(payload) > MAX_PAYLOAD_BYTES:
+                self.stats["oversize"] += 1
+                return
+            try:
+                self.sensor_queue.put_nowait((env.original_topic, payload, now, delta_t, rate, env.device_id, env.generation))
+                self.wake.set()
+            except Full:
+                self.stats["queue_full"] += 1
+            return
 
+        # Raw home/sensors/** is no longer authoritative for IDS identity. The
+        # Gateway-only internal envelope is the single sensor telemetry path.
+        if key.startswith("home/sensors/") or key.startswith(IGNORED_PREFIXES):
+            return
         if key not in KNOWN_TOPICS:
-            if key.startswith(IGNORED_PREFIXES):
+            if key.startswith("home/actuators/"):
+                self.stats["unknown"] += 1
                 return
             self.stats["unknown"] += 1
+            now = time.monotonic()
             if self.unknown_limiter.allow("unknown", now):
                 self.enforcement.execute_mitigation(
                     "Reconnaissance / Scanning", sanitize(key, 80), 99.0, "unknown topic"
                 )
             return
 
+        now = time.monotonic()
         with self._meter_lock:
-            m = self.meters.get(key)
-            if m is None:
-                m = self.meters[key] = RateMeter(now)
-            delta_t, rate = m.observe(now)
-
+            meter = self.meters.get(key)
+            if meter is None:
+                meter = self.meters[key] = RateMeter(now)
+            delta_t, rate = meter.observe(now)
         if not self.rate_limiter.allow(key, now):
             self.stats["rate"] += 1
-            with self._meter_lock:
-                next_alert = self._rate_alert_next.get(key, 0.0)
-                if now >= next_alert:
-                    self._rate_alert_next[key] = now + RATE_ALERT_INTERVAL_SEC
-                    self.enforcement.execute_mitigation(
-                        "DoS / Topic Flooding",
-                        key,
-                        99.0,
-                        f"rate limit exceeded offered={rate:.0f}/s",
-                    )
             return
-
-        try:
-            size = len(sample.payload)
-        except TypeError:
-            size = 0
-        if size > MAX_PAYLOAD_BYTES:
+        raw = sample.payload.to_bytes() if hasattr(sample.payload, "to_bytes") else bytes(sample.payload)
+        if len(raw) > MAX_PAYLOAD_BYTES:
             self.stats["oversize"] += 1
-            self.enforcement.execute_mitigation("Anomalous Payload", key, 99.0, f"oversize {size}B")
+            self.enforcement.execute_mitigation("Anomalous Payload", key, 99.0, f"oversize {len(raw)}B")
             return
-
-        raw = sample.payload.to_bytes()[:MAX_PAYLOAD_BYTES]
-        target = self.actuator_queue if key.startswith("home/actuators") else self.sensor_queue
         try:
-            target.put_nowait((key, raw, now, delta_t, rate))
+            self.actuator_queue.put_nowait((key, raw, now, delta_t, rate))
             self.wake.set()
         except Full:
             self.stats["queue_full"] += 1
@@ -588,9 +670,9 @@ class ZenohIDSAgent:
 
         self.subs = [
             (self.session.declare_subscriber("home/actuators/**", FifoChannel(1024)), False),
-            (self.session.declare_subscriber("home/sensors/**", RingChannel(512)), False),
-            (self.session.declare_subscriber("**", RingChannel(256)), True),
+            (self.session.declare_subscriber(f"{INTERNAL_TELEMETRY_PREFIX}**", RingChannel(512)), False),
         ]
+        self.pep_ack_sub = self.session.declare_subscriber(f"{PEP_ACK_PREFIX}**", self._on_pep_ack)
         self.pumps = []
         for sub, skip in self.subs:
             t = threading.Thread(target=self._pump, args=(sub, skip), daemon=True)

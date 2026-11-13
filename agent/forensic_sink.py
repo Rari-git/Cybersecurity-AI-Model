@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 
 from storage.telemetry_db import LumenStorageManager
+from storage.persistence import persist_incident_capture
 from utils.rate_limit import TokenBucketRateLimiter
 
 
@@ -68,12 +69,11 @@ class ForensicQuarantineSink:
             self.dropped_quota += 1
             return SinkIngestResult(False, "SINK_STORAGE_QUOTA_EXCEEDED")
 
-        self._bytes_used[device_id] = used + len(raw_payload)
-        self.stored_count += 1
         now_ns = time.time_ns()
         retention_ns = now_ns + 14 * 24 * 3600 * 1_000_000_000
 
-        self.storage.enqueue_incident_capture(
+        persist_incident_capture(
+            self.storage,
             (
                 session_id,
                 device_id,
@@ -97,4 +97,7 @@ class ForensicQuarantineSink:
                 retention_ns,
             )
         )
+        # Advance in-memory quotas only after the synchronous forensic commit.
+        self._bytes_used[device_id] = used + len(raw_payload)
+        self.stored_count += 1
         return SinkIngestResult(True, "STORED_IN_FORENSIC_SINK")

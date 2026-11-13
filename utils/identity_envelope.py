@@ -6,7 +6,7 @@ per-device ingress key. Payload identity fields are never trusted as authority.
 from __future__ import annotations
 
 import base64
-import hashlib
+import hmac
 import json
 import re
 import time
@@ -91,9 +91,47 @@ class AuthenticatedTelemetryEnvelope:
             raise ValueError("invalid certificate fingerprint")
         if not _TOPIC.fullmatch(env.original_topic) or ".." in env.original_topic.split("/"):
             raise ValueError("invalid envelope topic")
-        if env.event_timestamp_ns <= 0 or not env.message_id:
-            raise ValueError("invalid envelope timestamp/message id")
+        if (
+            isinstance(env.event_timestamp_ns, bool)
+            or not isinstance(env.event_timestamp_ns, int)
+            or env.event_timestamp_ns <= 0
+            or not isinstance(env.message_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", env.message_id)
+            or not isinstance(env.gateway_instance_id, str)
+            or not _DEVICE_ID.fullmatch(env.gateway_instance_id)
+        ):
+            raise ValueError("invalid envelope timestamp/message/gateway identity")
         payload = base64.b64decode(env.payload_b64, validate=True)
         if not payload:
             raise ValueError("empty envelope payload")
         return env, payload
+
+
+def validate_active_identity(
+    envelope: AuthenticatedTelemetryEnvelope, active_identity,
+) -> None:
+    """Raise when an envelope does not exactly match the IDS-side active PKI identity."""
+    if (
+        envelope.device_id != active_identity.device_id
+        or envelope.generation != active_identity.generation
+        or envelope.certificate_common_name != active_identity.common_name
+        or not hmac.compare_digest(
+            bytes.fromhex(envelope.certificate_fingerprint_sha256),
+            active_identity.certificate_fingerprint,
+        )
+    ):
+        raise ValueError("forged or stale active certificate identity envelope")
+
+
+def validate_envelope_route(
+    envelope: AuthenticatedTelemetryEnvelope, key: str, allowed_topics_by_device: dict[str, str],
+) -> None:
+    """Ensure the internal key and original sensor topic are bound to the same registry ID."""
+    if key != f"internal/ids/telemetry/{envelope.device_id}":
+        raise ValueError("internal envelope key/device_id mismatch")
+    if allowed_topics_by_device.get(envelope.device_id) != envelope.original_topic:
+        raise ValueError("envelope device/topic is not registered")
+
+# Friendly public name for callers that refer to the authenticated envelope
+# generically; keep the original class name as a backward-compatible alias.
+IdentityEnvelope = AuthenticatedTelemetryEnvelope

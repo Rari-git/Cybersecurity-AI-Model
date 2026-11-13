@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS baseline_sessions (
     source_type TEXT NOT NULL CHECK(source_type IN ('baseline_lab', 'live_validated')),
     git_hash TEXT,
     config_json TEXT NOT NULL,
-    approved_for_training INTEGER NOT NULL DEFAULT 0 CHECK(approved_for_training IN (0, 1))
+    approved_for_training INTEGER NOT NULL DEFAULT 0 CHECK(approved_for_training IN (0, 1)),
+    CHECK(source_type <> 'live_validated' OR approved_for_training = 0)
 );
 
 CREATE TABLE IF NOT EXISTS raw_events (
@@ -119,7 +120,7 @@ CREATE TABLE IF NOT EXISTS device_registry (
     criticality TEXT NOT NULL DEFAULT 'normal' CHECK(criticality IN ('low', 'normal', 'safety_critical')),
     current_state TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(current_state IN (
         'ACTIVE', 'MONITORING', 'ENFORCEMENT_PENDING',
-        'SHADOW_QUARANTINE', 'ENFORCEMENT_FAILED', 'RECOVERY_PENDING',
+        'SHADOW_QUARANTINE', 'QUARANTINED', 'ENFORCEMENT_FAILED', 'RECOVERY_PENDING',
         'REVOKED', 'FAULT', 'OFFLINE'
     )),
     updated_at_ns INTEGER NOT NULL,
@@ -168,3 +169,12 @@ CREATE TABLE IF NOT EXISTS enforcement_audit (
 
 CREATE INDEX IF NOT EXISTS idx_enforcement_dev_ts
     ON enforcement_audit(device_id, decided_at_ns);
+
+CREATE TABLE IF NOT EXISTS policy_state (
+    device_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    current_state TEXT NOT NULL,
+    anomaly_history_json TEXT NOT NULL,
+    clean_streak INTEGER NOT NULL DEFAULT 0,
+    updated_at_ns INTEGER NOT NULL
+);

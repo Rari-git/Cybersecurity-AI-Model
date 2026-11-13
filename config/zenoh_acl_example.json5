@@ -39,17 +39,31 @@
       { id: "in_put_home_actuators",   messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
       { id: "in_put_alerts",           messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
 
+      // E1: Gateway-only internal identity envelope publisher.
+      { id: "in_put_internal_ids_telemetry", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["internal/ids/telemetry/**"] },
+      // E2: Gateway-only correlated PEP ACK publisher.
+      { id: "in_put_pep_ack", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
+      { id: "in_put_policy_ctrl", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
+
       // ---- livrare (router -> client)
       { id: "out_put_ingest",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["ingest/**"] },
       { id: "out_put_home",            messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/**"] },
       { id: "out_put_actuator_cmd",    messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/actuators/**"] },
       { id: "out_put_alerts",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/security/alerts"] },
 
+      { id: "out_put_internal_ids_telemetry", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["internal/ids/telemetry/**"] },
+      { id: "out_put_pep_ack", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
+      { id: "out_put_policy_ctrl", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["control/policy/**"] },
+
       // ---- abonări
       { id: "sub_ingest",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/**"] },
       { id: "sub_home",                messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/**"] },
       { id: "sub_actuator_cmd",        messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
       { id: "sub_alerts",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+
+      { id: "sub_internal_ids_telemetry", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["internal/ids/telemetry/**"] },
+      { id: "sub_pep_ack", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
+      { id: "sub_policy_ctrl", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
 
       // ---- honeypot: oricine autentificat poate SONDA capcanele (altfel scanarea nu declanșează alerta)
       { id: "honeypot_declare",        messages: ["declare_queryable"],  flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
@@ -89,9 +103,12 @@
       // SINGURUL subiect cu drept de publicare pe home/sensors/** și home/actuators/**
       { rules: ["sub_ingest", "out_put_ingest", "in_put_home_sensors", "in_put_home_actuators", "in_put_alerts"],
         subjects: ["gateway"] },
+      { rules: ["in_put_internal_ids_telemetry", "in_put_pep_ack", "sub_policy_ctrl", "out_put_policy_ctrl"], subjects: ["gateway"] },
 
       // IDS: doar abonare pasivă pe home/** și ingest/** + publicare alerte. Fără reguli honeypot_*.
-      { rules: ["sub_home", "out_put_home", "sub_ingest", "out_put_ingest", "in_put_alerts"],
+      { rules: ["sub_home", "out_put_home", "sub_ingest", "out_put_ingest", "in_put_alerts", "in_put_policy_ctrl",
+                "sub_internal_ids_telemetry", "out_put_internal_ids_telemetry",
+                "sub_pep_ack", "out_put_pep_ack"],
         subjects: ["ids"] },
 
       // HONEYPOT: doar momelile + publicare alerte. FĂRĂ sub_home / sub_ingest / out_put_*:
