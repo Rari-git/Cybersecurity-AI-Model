@@ -33,7 +33,11 @@ from utils.features_v5 import (
     FEATURE_NAMES,
     FEATURE_DIM,
 )
-from models.bundle_loader import generate_model_signing_keypair, sign_model_bundle
+from models.bundle_loader import (
+    generate_model_signing_keypair,
+    hash_unsigned_candidate_artifacts,
+    sign_model_bundle,
+)
 
 
 class TemporalLSTMAutoencoder(nn.Module):
@@ -383,6 +387,9 @@ def train_and_export_bundle(
         encoding="utf-8",
     )
 
+    # Bind candidate model/schema/scaler/threshold bytes before shadow evaluation.
+    candidate_files_sha256 = hash_unsigned_candidate_artifacts(bdir)
+
     metadata = {
         "model_version": f"v6-candidate-{run_id}" if not sign_bundle else f"v5-candidate-{run_id}",
         "architecture": "TemporalLSTMAutoencoder(12->32->16->32->12)",
@@ -400,6 +407,7 @@ def train_and_export_bundle(
         "validation_normal_error_p99": round(validation_p99, 8),
         "dataset_policy": "approved_clean_baseline_only",
         "offline_training": True,
+        "candidate_files_sha256": candidate_files_sha256,
         "curation_digests": curation_digests,
     }
     (bdir / "manifest.json").write_text(

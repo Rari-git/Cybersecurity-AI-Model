@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 
 from models.bundle_loader import (
+    load_unsigned_candidate_for_evaluation,
     sign_model_bundle,
     validate_unsigned_candidate_bundle,
     verify_and_load_bundle,
@@ -168,7 +169,13 @@ class _ShadowPolicyStorage:
         return None
 
 
-def _score_bundle(bundle_dir: Path, public_key_path: Path, groups: list[EvaluationGroup]) -> dict[str, Any]:
+def _score_bundle(
+    bundle_dir: Path,
+    public_key_path: Path,
+    groups: list[EvaluationGroup],
+    *,
+    unsigned_candidate: bool = False,
+) -> dict[str, Any]:
     """Run local CPU ONNX inference through the real orthogonal policy engine.
 
     Protocol-labelled captures are counted as ingress/protocol detections and
@@ -181,7 +188,13 @@ def _score_bundle(bundle_dir: Path, public_key_path: Path, groups: list[Evaluati
     from agent.statistical_detectors import OperationalFaultClassifier, TwoSidedCusumDetector
     from utils.features_v5 import DeviceTopicFeatureExtractor, RobustFeatureScaler
 
-    verified = verify_and_load_bundle(bundle_dir, public_key_path)
+    # Candidate remains unsigned until promotion gates pass. Its local hashes
+    # are checked here; the active runtime bundle always requires Ed25519.
+    verified = (
+        load_unsigned_candidate_for_evaluation(bundle_dir)
+        if unsigned_candidate
+        else verify_and_load_bundle(bundle_dir, public_key_path)
+    )
     needs_onnx = any(group.category != "protocol" for group in groups)
     session = None
     if needs_onnx:
@@ -360,7 +373,9 @@ def evaluate_promotion_metrics(
     if not faults:
         raise RuntimeError("promotion gate requires fault regression scenarios")
     groups = clean + attacks + protocols + faults
-    candidate = _score_bundle(candidate_dir, public_key_path, groups)
+    candidate = _score_bundle(
+        candidate_dir, public_key_path, groups, unsigned_candidate=True
+    )
     active = _score_bundle(active_dir, public_key_path, groups)
     return {"candidate": candidate, "active": active, "group_count": len(groups)}
 
@@ -423,7 +438,7 @@ def evaluate_and_promote_candidate(
     *,
     storage: LumenStorageManager | None,
     public_key_path: str | Path,
-    private_key_path: str | Path,
+    private_key_path: str | Path | None,
     model_root: str | Path = "models",
     pointer_path: str | Path | None = None,
     previous_pointer_path: str | Path | None = None,
@@ -442,11 +457,13 @@ def evaluate_and_promote_candidate(
     candidate_root = (root / "candidates").resolve()
     if candidate.bundle_dir != candidate_root and candidate_root not in candidate.bundle_dir.parents:
         raise ValueError("candidate must reside under models/candidates")
-    if not Path(private_key_path).is_file():
-        raise FileNotFoundError("offline Ed25519 signing private key is unavailable")
-    key_path = Path(private_key_path).resolve(strict=True)
-    if root == key_path or root in key_path.parents:
-        raise ValueError("model signing private key must remain outside the runtime model directory")
+    key_path: Path | None = None
+    if private_key_path is not None and Path(private_key_path).is_file():
+        key_path = Path(private_key_path).resolve(strict=True)
+        if root == key_path or root in key_path.parents:
+            raise ValueError("model signing private key must remain outside the runtime model directory")
+    if not Path(public_key_path).is_file():
+        raise FileNotFoundError("runtime model-verification public key is unavailable")
     if not pointer.is_file():
         raise FileNotFoundError("active_model.json is required; promotion cannot bootstrap trust from a candidate")
     active_dir = resolve_active_bundle(root, pointer, root / "lumen_model_bundle")
@@ -468,6 +485,25 @@ def evaluate_and_promote_candidate(
         _append_audit(root / "promotion_history.jsonl", {
             "at_ns": time.time_ns(), "candidate": candidate.metadata.get("model_version"),
             "promoted": False, "gates": gates, "reason": result.reason,
+        })
+        return result
+
+    # Without the offline private key, keep the candidate unsigned and do not
+    # change the active pointer even when every quality gate passes.
+    if key_path is None:
+        result = PromotionResult(
+            promoted=False,
+            candidate_dir=str(candidate.bundle_dir),
+            gates=gates,
+            metrics=metrics,
+            reason="OFFLINE_SIGNING_KEY_UNAVAILABLE",
+        )
+        _append_audit(root / "promotion_history.jsonl", {
+            "at_ns": time.time_ns(),
+            "candidate": candidate.metadata.get("model_version"),
+            "promoted": False,
+            "gates": gates,
+            "reason": result.reason,
         })
         return result
 

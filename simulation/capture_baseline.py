@@ -64,7 +64,7 @@ def _simulate_sensor_reading(device_id: str, step: int, rng: random.Random) -> b
 def run_baseline_capture(
     db_dir: str | Path = "logs/db",
     sessions: int = 3,
-    events_per_sensor: int = 300,
+    events_per_sensor: int = 400,
     rate_hz: float = 1.0,
     seed: int = 42,
     realtime_sleep: bool = False,
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Capture clean baseline telemetry into SQLite.")
     parser.add_argument("--db-dir", default="logs/db")
     parser.add_argument("--sessions", type=int, default=3)
-    parser.add_argument("--events", type=int, default=300, help="Events per sensor per session")
+    parser.add_argument("--events", type=int, default=400, help="Events per sensor per session")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--realtime", action="store_true")
     args = parser.parse_args()

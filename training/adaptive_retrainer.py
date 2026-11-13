@@ -79,14 +79,24 @@ def run_adaptive_cycle(
     """Curate, train unsigned candidate, shadow-evaluate, then conditionally promote."""
     _require_offline_authority()
     run_id = run_id or uuid.uuid4().hex
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or run_id in {".", ".."}
+        or Path(run_id).name != run_id
+        or "/" in run_id
+        or "\\" in run_id
+    ):
+        raise ValueError("run_id must be a single safe path segment")
     root = Path(model_root).expanduser().resolve()
     keys = Path(key_dir).expanduser().resolve()
     private_key = keys / "model_signing_ed25519.key"
     public_key = Path(public_key_path).resolve() if public_key_path else keys / "model_signing_ed25519.pub"
-    if not private_key.is_file() or not public_key.is_file():
+    if not public_key.is_file():
         raise FileNotFoundError(
-            "offline Ed25519 model-signing keypair must be provisioned outside the runtime model directory"
+            "runtime model-verification public key is required to evaluate the active bundle"
         )
+    # Training/shadow scoring may run without signing authority; promotion is withheld.
     if root == keys or root in keys.parents:
         raise ValueError("offline signing authority keys must be outside models/")
 
@@ -110,6 +120,8 @@ def run_adaptive_cycle(
                 heldout = (approved[-1],)
                 candidate_dir = root / "candidates" / run_id
                 candidate_dir.parent.mkdir(parents=True, exist_ok=True)
+                # Never overwrite or reuse a previous candidate directory.
+                candidate_dir.mkdir(parents=False, exist_ok=False)
                 metadata = train_and_export_bundle(
                     db_dir=db_dir,
                     bundle_dir=candidate_dir,
@@ -125,7 +137,7 @@ def run_adaptive_cycle(
                     candidate_dir,
                     storage=manager,
                     public_key_path=public_key,
-                    private_key_path=private_key,
+                    private_key_path=private_key if private_key.is_file() else None,
                     model_root=root,
                     evaluator=evaluator,
                 )

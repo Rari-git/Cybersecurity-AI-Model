@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -208,9 +209,28 @@ def curate_clean_sessions(
 
             try:
                 config = json.loads(str(session["config_json"]))
-            except (TypeError, json.JSONDecodeError):
+                if not isinstance(config, dict):
+                    raise ValueError("session config must be an object")
+            except (TypeError, ValueError):
                 config = {}
                 reasons.append("INVALID_SESSION_CONFIG")
+
+            expected_events = config.get("events_per_sensor")
+            if expected_events is not None:
+                capture_run_id = config.get("capture_run_id")
+                if (
+                    not isinstance(capture_run_id, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", capture_run_id) is None
+                    or not sid.startswith(f"baseline-lab-{capture_run_id}-")
+                ):
+                    reasons.append("CAPTURE_RUN_ID_MISSING_OR_INVALID")
+                if (
+                    isinstance(expected_events, bool)
+                    or not isinstance(expected_events, int)
+                    or expected_events < 1
+                ):
+                    reasons.append("INVALID_EVENTS_PER_SENSOR")
+                    expected_events = None
 
             rows = normal.execute(
                 """SELECT event_id, device_id, generation, topic, gateway_ts_ns,
@@ -224,6 +244,24 @@ def curate_clean_sessions(
             }
             devices = {(str(row["device_id"]), int(row["generation"])) for row in rows}
             expected = _expected_streams(config, expected_sensor_topics)
+
+            unexpected_streams = sorted(observed_streams - expected)
+            if unexpected_streams:
+                rendered = ",".join(f"{device}::{topic}" for device, topic in unexpected_streams)
+                reasons.append(f"UNEXPECTED_SENSOR_STREAMS:{rendered}")
+
+            if expected_events is not None:
+                counts: dict[tuple[str, str], int] = {}
+                for row in rows:
+                    stream = (str(row["device_id"]), str(row["topic"]))
+                    counts[stream] = counts.get(stream, 0) + 1
+                for device, topic in sorted(expected):
+                    actual_count = counts.get((device, topic), 0)
+                    if actual_count != expected_events:
+                        reasons.append(
+                            f"EVENT_COUNT_MISMATCH:{device}:{topic}:{actual_count}:{expected_events}"
+                        )
+
             expected_devices = {device for device, _topic in expected}
             # A configured sensor that emitted no normal row must still be
             # checked for a fault/security transition during this session.

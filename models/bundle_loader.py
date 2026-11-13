@@ -273,11 +273,33 @@ def verify_and_load_bundle(bundle_dir: str | Path, public_key_path: str | Path) 
     )
 
 
+def hash_unsigned_candidate_artifacts(bundle_dir: str | os.PathLike[str]) -> dict[str, str]:
+    # Hash every candidate artifact except manifest.json, which stores these hashes.
+    root = _safe_bundle_root(bundle_dir)
+    artifacts = _artifact_files(root)
+    return {
+        name: sha256_file(path)
+        for name, path in sorted(artifacts.items())
+        if name != "manifest.json"
+    }
+
+
 @dataclass(frozen=True)
 class UnsignedCandidateBundle:
     bundle_dir: Path
     metadata: dict[str, Any]
     artifacts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CandidateEvaluationBundle:
+    # Integrity-checked candidate inputs; not a runtime trust object.
+    bundle_dir: Path
+    onnx_path: Path
+    manifest: dict[str, Any]
+    feature_schema: dict[str, Any]
+    scaler: dict[str, Any]
+    thresholds: dict[str, Any]
 
 
 def validate_unsigned_candidate_bundle(bundle_dir: str | Path) -> UnsignedCandidateBundle:
@@ -303,6 +325,26 @@ def validate_unsigned_candidate_bundle(bundle_dir: str | Path) -> UnsignedCandid
         raise ValueError("candidate manifest.json is invalid") from exc
     if not isinstance(metadata, dict):
         raise ValueError("candidate manifest must be a JSON object")
+
+    declared_hashes = metadata.get("candidate_files_sha256")
+    if not isinstance(declared_hashes, dict):
+        raise ValueError("candidate artifact SHA-256 declarations are missing")
+    candidate_artifacts = {
+        name: path for name, path in artifacts.items() if name != "manifest.json"
+    }
+    if set(declared_hashes) != set(candidate_artifacts):
+        raise ValueError("candidate artifact file set mismatch")
+    for name, path in candidate_artifacts.items():
+        digest = declared_hashes.get(name)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest.lower())
+        ):
+            raise ValueError(f"invalid candidate SHA-256 declaration for {name}")
+        if not hmac.compare_digest(sha256_file(path), digest.lower()):
+            raise ValueError(f"candidate SHA-256 mismatch for {name}")
+
     if metadata.get("offline_training") is not True:
         raise ValueError("candidate was not produced by the offline training pipeline")
     if metadata.get("dataset_policy") != "approved_clean_baseline_only":
@@ -331,3 +373,27 @@ def validate_unsigned_candidate_bundle(bundle_dir: str | Path) -> UnsignedCandid
     if not isinstance(metadata.get("validation_normal_error_p95"), (int, float)):
         raise ValueError("candidate validation normal error metric is missing")
     return UnsignedCandidateBundle(root, metadata, tuple(sorted(artifacts)))
+
+
+def load_unsigned_candidate_for_evaluation(
+    bundle_dir: str | os.PathLike[str],
+) -> CandidateEvaluationBundle:
+    # Load a hash-checked unsigned candidate for isolated offline shadow scoring.
+    # This type is deliberately not accepted by the online runtime.
+    candidate = validate_unsigned_candidate_bundle(bundle_dir)
+    root = candidate.bundle_dir
+
+    def read_json(name: str) -> dict[str, Any]:
+        value = json.loads((root / name).read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must contain a JSON object")
+        return value
+
+    return CandidateEvaluationBundle(
+        bundle_dir=root,
+        onnx_path=root / "model.onnx",
+        manifest=candidate.metadata,
+        feature_schema=read_json("feature_schema.json"),
+        scaler=read_json("scaler.json"),
+        thresholds=read_json("thresholds.json"),
+    )

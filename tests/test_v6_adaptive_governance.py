@@ -179,3 +179,53 @@ def test_missing_sensor_coverage_prevents_clean_approval(tmp_path):
         assert "INSUFFICIENT_SENSOR_COVERAGE" in decision.reasons
     finally:
         storage.close()
+
+def test_legacy_capture_without_run_id_is_rejected(tmp_path):
+    storage = LumenStorageManager(paths=DBPaths.from_dir(tmp_path / "db"), enable_writers=True)
+    try:
+        sid = "baseline-lab-s01-seed42"
+        storage.register_baseline_session(
+            sid, "baseline_lab",
+            {
+                "events_per_sensor": 10,
+                "expected_sensor_topics": [f"{DEVICE}::{TOPIC}"],
+                "compressed_time": False,
+            },
+        )
+        for index in range(10):
+            persist_normal_event(storage, _event_row(sid, index))
+        storage.finalize_baseline_session(sid)
+        decision = curate_clean_sessions(
+            storage, min_duration_sec=0, min_sensor_coverage=1.0, session_ids=[sid]
+        )[0]
+        assert not decision.approved
+        assert "CAPTURE_RUN_ID_MISSING_OR_INVALID" in decision.reasons
+    finally:
+        storage.close()
+
+
+def test_merged_capture_exceeding_configured_per_sensor_count_is_rejected(tmp_path):
+    storage = LumenStorageManager(paths=DBPaths.from_dir(tmp_path / "db"), enable_writers=True)
+    try:
+        capture_run_id = "0123456789abcdef0123456789abcdef"
+        sid = f"baseline-lab-{capture_run_id}-s01-seed42"
+        storage.register_baseline_session(
+            sid, "baseline_lab",
+            {
+                "capture_run_id": capture_run_id,
+                "events_per_sensor": 10,
+                "expected_sensor_topics": [f"{DEVICE}::{TOPIC}"],
+                "compressed_time": False,
+            },
+        )
+        # Simulate a second capture's telemetry appended to the first session.
+        for index in range(20):
+            persist_normal_event(storage, _event_row(sid, index))
+        storage.finalize_baseline_session(sid)
+        decision = curate_clean_sessions(
+            storage, min_duration_sec=0, min_sensor_coverage=1.0, session_ids=[sid]
+        )[0]
+        assert not decision.approved
+        assert f"EVENT_COUNT_MISMATCH:{DEVICE}:{TOPIC}:20:10" in decision.reasons
+    finally:
+        storage.close()

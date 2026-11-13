@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from models.bundle_loader import generate_model_signing_keypair, sign_model_bundle, verify_and_load_bundle
+from models.bundle_loader import (
+    generate_model_signing_keypair,
+    hash_unsigned_candidate_artifacts,
+    sign_model_bundle,
+    validate_unsigned_candidate_bundle,
+    verify_and_load_bundle,
+)
 from models.model_lifecycle import resolve_active_bundle
 from storage.persistence import persist_normal_event
 from storage.telemetry_db import DBPaths, LumenStorageManager
@@ -125,6 +131,7 @@ def _unsigned_candidate(path: Path, *, validation_p95=1.0):
         "model_version": "v6-candidate-unit-test",
         "dataset_policy": "approved_clean_baseline_only",
         "offline_training": True,
+        "candidate_files_sha256": hash_unsigned_candidate_artifacts(path),
         "train_sessions": ["train-a"],
         "val_sessions": ["val-a"],
         "heldout_sessions": ["holdout-a"],
@@ -460,3 +467,97 @@ def test_recent_post_promotion_rates_are_read_from_local_sqlite(tmp_path):
         assert observed["fault_rate"] == pytest.approx(1 / 24)
     finally:
         storage.close()
+
+def test_unsigned_candidate_artifacts_are_hash_checked_before_shadow_evaluation(tmp_path):
+    candidate = tmp_path / "candidate"
+    _unsigned_candidate(candidate)
+    (candidate / "model.onnx").write_bytes(b"tampered-candidate-model")
+    with pytest.raises(ValueError, match="candidate SHA-256 mismatch"):
+        validate_unsigned_candidate_bundle(candidate)
+
+
+def test_shadow_evaluator_loads_hash_checked_unsigned_candidate(tmp_path, monkeypatch):
+    import sys
+    from types import ModuleType
+    import training.promotion_gate as gate
+
+    class FakeOrtSession:
+        def run(self, _outputs, inputs):
+            return [inputs["window_input"].copy()]
+
+    class FakeOrt(ModuleType):
+        @staticmethod
+        def InferenceSession(_path, providers=None):
+            return FakeOrtSession()
+
+    candidate = tmp_path / "candidate"
+    _unsigned_candidate(candidate)
+    monkeypatch.setitem(sys.modules, "onnxruntime", FakeOrt("onnxruntime"))
+
+    events = tuple({
+        "device_id": DEVICE,
+        "topic": TOPIC,
+        "generation": 1,
+        "gateway_ts_ns": (index + 1) * 1_000_000_000,
+        "raw_payload": f"{350.0 + index * 0.01:.2f}".encode(),
+        "numeric_value": 350.0 + index * 0.01,
+        "operation": "put",
+    } for index in range(24))
+    group = gate.EvaluationGroup("clean:unsigned", "clean", DEVICE, TOPIC, events)
+    result = gate._score_bundle(
+        candidate, tmp_path / "unused-public-key.pem", [group], unsigned_candidate=True
+    )
+    assert result["clean_event_count"] == 24
+    assert result["normal_error_p95"] == pytest.approx(0.0)
+    assert result["normal_threshold_exceedance_rate"] == 0.0
+
+
+def test_offline_worker_can_train_and_shadow_without_signing_private_key(tmp_path, monkeypatch):
+    import shutil
+    import sys
+    import torch
+    import training.adaptive_retrainer as adaptive
+
+    db_dir = tmp_path / "db"
+    model_root = tmp_path / "models"
+    bootstrap_keys = tmp_path / "bootstrap-signer"
+    bootstrap_keys.mkdir()
+    private, bootstrap_public = _keypair(bootstrap_keys)
+    _initialize_active(model_root, private, bootstrap_public)
+
+    runtime_keys = tmp_path / "runtime-public-only"
+    runtime_keys.mkdir()
+    public = runtime_keys / "model_signing_ed25519.pub"
+    shutil.copyfile(bootstrap_public, public)
+    _seed_curated_sessions(db_dir, session_count=3, events=18)
+
+    def fake_onnx_export(_model, _input, output_path, **_kwargs):
+        Path(output_path).write_bytes(b"test-double-onnx-artifact")
+
+    monkeypatch.setattr(torch.onnx, "export", fake_onnx_export)
+    monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
+    monkeypatch.setenv("LUMEN_ADAPTIVE_OFFLINE", "1")
+
+    result = adaptive.run_adaptive_cycle(
+        db_dir=db_dir,
+        model_root=model_root,
+        key_dir=runtime_keys,
+        public_key_path=public,
+        min_duration_sec=0,
+        min_sensor_coverage=1.0,
+        epochs=1,
+        seq_len=4,
+        run_id="candidate-without-signer",
+        evaluator=lambda _candidate, _active, _manifest: _metric_pair(),
+    )
+
+    assert result.candidate_dir
+    assert result.training_metadata["signed"] is False
+    assert result.promotion is not None
+    assert not result.promotion.promoted
+    assert result.promotion.reason == "OFFLINE_SIGNING_KEY_UNAVAILABLE"
+    candidate = Path(result.candidate_dir)
+    assert (candidate / "manifest.json").is_file()
+    assert not (candidate / "model_manifest.json").exists()
+    pointer = json.loads((model_root / "active_model.json").read_text())
+    assert pointer["active_bundle"] == "lumen_model_bundle"
