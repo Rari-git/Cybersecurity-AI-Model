@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from models.bundle_loader import verify_and_load_bundle
+from models.bundle_loader import verify_and_load_bundle, _is_symlink_or_reparse
 
 POINTER_SCHEMA = 1
 
@@ -82,9 +82,13 @@ def promote_candidate(
     *,
     model_root: str | Path = "models",
     pointer_path: str | Path = "models/active_model.json",
+    previous_pointer_path: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(model_root).resolve()
-    candidate = Path(candidate_dir).resolve(strict=True)
+    requested_candidate = Path(candidate_dir)
+    if _is_symlink_or_reparse(requested_candidate):
+        raise ValueError("candidate bundle root must not be a symlink or reparse point")
+    candidate = requested_candidate.resolve(strict=True)
     candidates_root = (root / "candidates").resolve()
     if candidate != candidates_root and candidates_root not in candidate.parents:
         raise ValueError("only verified candidates under models/candidates may be promoted")
@@ -94,11 +98,19 @@ def promote_candidate(
     if not pointer.is_absolute():
         pointer = pointer.resolve()
     previous = None
+    previous_pointer = Path(previous_pointer_path) if previous_pointer_path is not None else root / "previous_model.json"
+    if not previous_pointer.is_absolute():
+        previous_pointer = previous_pointer.resolve()
+    current = None
     if pointer.is_file():
         current = json.loads(pointer.read_text(encoding="utf-8"))
         if current.get("schema") != POINTER_SCHEMA:
             raise ValueError("refusing to replace malformed active-model pointer")
         previous = current.get("active_bundle")
+        if previous:
+            # Preserve the full prior pointer independently of the inline
+            # previous_bundle field so operators can inspect/restore it.
+            _write_pointer_atomic(previous_pointer, current)
     payload = {
         "schema": POINTER_SCHEMA,
         "active_bundle": relative,
@@ -115,6 +127,7 @@ def rollback_model(
     model_root: str | Path = "models",
     pointer_path: str | Path = "models/active_model.json",
     public_key_path: str | Path,
+    previous_pointer_path: str | Path | None = None,
 ) -> dict[str, Any]:
     root = Path(model_root).resolve()
     pointer = Path(pointer_path)
@@ -123,6 +136,14 @@ def rollback_model(
     current = json.loads(pointer.read_text(encoding="utf-8"))
     if current.get("schema") != POINTER_SCHEMA or not current.get("previous_bundle"):
         raise RuntimeError("no previous approved model is available for rollback")
+    previous_pointer = Path(previous_pointer_path) if previous_pointer_path is not None else root / "previous_model.json"
+    if not previous_pointer.is_absolute():
+        previous_pointer = previous_pointer.resolve()
+    previous_doc = None
+    if previous_pointer.is_file():
+        previous_doc = json.loads(previous_pointer.read_text(encoding="utf-8"))
+        if previous_doc.get("schema") != POINTER_SCHEMA or previous_doc.get("active_bundle") != current.get("previous_bundle"):
+            raise ValueError("previous_model.json does not match the active pointer's rollback target")
     previous = _relative_bundle(root, current["previous_bundle"])
     verified = verify_and_load_bundle(previous, public_key_path)
     payload = {
@@ -133,5 +154,8 @@ def rollback_model(
         "promoted_at_unix_ns": __import__("time").time_ns(),
         "rollback": True,
     }
+    # Keep the former active pointer as the next rollback target, then atomically
+    # publish the restored pointer. This supports repeated rollback/promote cycles.
+    _write_pointer_atomic(previous_pointer, current)
     _write_pointer_atomic(pointer, payload)
     return payload

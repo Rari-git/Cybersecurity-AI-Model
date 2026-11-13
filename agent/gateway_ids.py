@@ -42,6 +42,10 @@ from utils.device_security import DeviceSecurityManager
 from utils.device_identity import load_active_device_identity, load_active_device_signing_key
 from utils.identity_envelope import IdentityEnvelope
 from utils.sensor_payload import parse_sensor_frame, MAX_SENSOR_FRAME_BYTES
+from utils.boot_registration import (
+    BootRegistrationAuthority, BootRegistrationError, canonical_json, boot_topic,
+    BOOT_REQUEST_PREFIX, BOOT_PROOF_PREFIX,
+)
 from utils.key_lifecycle import KeyHealthMonitor, RevocationLedger
 
 MAX_PAYLOAD_BYTES = 512
@@ -106,6 +110,16 @@ class ZenohInlineGateway:
             raise RuntimeError("LUMEN_CERT_POINTER is required for authenticated Gateway-to-IDS envelopes")
         allowed_topics = {spec.device_id: {spec.target_topic} for spec in self.registry.enabled_devices()}
         self.admission_gate = AdmissionGate(self.storage, allowed_topics)
+        cert_ledger = os.environ.get("LUMEN_CERT_REVOCATIONS", "").strip()
+        if not cert_ledger or not Path(cert_ledger).is_file():
+            raise RuntimeError("LUMEN_CERT_REVOCATIONS is required for V6 boot registration")
+        self.boot_registration = BootRegistrationAuthority(
+            self.admission_gate,
+            cert_pointer=self.cert_pointer,
+            revocation_ledger=cert_ledger,
+            session_id=self.run_id,
+            ttl_sec=float(os.environ.get("LUMEN_BOOT_CHALLENGE_TTL_SEC", "20")),
+        )
         self.storage.register_baseline_session(
             session_id=self.run_id,
             source_type="live_validated",
@@ -177,6 +191,8 @@ class ZenohInlineGateway:
         self.enforcement = EnforcementEngine(self.session, is_inline_gateway=True)
         self.sub = None
         self.policy_sub = None
+        self.boot_request_sub = None
+        self.boot_proof_sub = None
         self.worker_thread = None
         self.metrics_path = os.environ.get("LUMEN_GATEWAY_METRICS_PATH", DEFAULT_METRICS_PATH)
         Path(self.metrics_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
@@ -210,6 +226,92 @@ class ZenohInlineGateway:
     def is_shadow_quarantined(self, device_id: str) -> bool:
         with self._shadow_lock:
             return device_id in self._shadow_quarantined
+
+    @staticmethod
+    def _sample_bytes(sample) -> bytes:
+        payload = sample.payload
+        return payload.to_bytes() if hasattr(payload, "to_bytes") else bytes(payload)
+
+    @staticmethod
+    def _boot_route_device(key: str, kind: str) -> str:
+        prefix = {"request": BOOT_REQUEST_PREFIX, "proof": BOOT_PROOF_PREFIX}.get(kind, "")
+        if not prefix:
+            raise BootRegistrationError("INVALID_BOOT_ROUTE")
+        if not key.startswith(prefix):
+            raise BootRegistrationError("INVALID_BOOT_ROUTE")
+        device_id = key[len(prefix):]
+        if not SAFE_DEVICE_ID_RE.fullmatch(device_id):
+            raise BootRegistrationError("INVALID_BOOT_ROUTE")
+        return device_id
+
+    def _publish_boot_result(self, device_id: str, document: dict) -> None:
+        if not SAFE_DEVICE_ID_RE.fullmatch(device_id):
+            return
+        self.session.put(
+            boot_topic("result", device_id),
+            canonical_json(document),
+        )
+
+    def _on_boot_request(self, sample) -> None:
+        device_id = ""
+        try:
+            key = str(sample.key_expr)
+            device_id = self._boot_route_device(key, "request")
+            spec = self.registry.get(device_id)
+            if spec is None or not spec.enabled:
+                raise BootRegistrationError("UNKNOWN_SENSOR_IDENTITY")
+            active_identity = load_active_device_identity(self.cert_pointer, device_id)
+            if active_identity.common_name != spec.cert_cn and not active_identity.common_name.startswith(f"{spec.cert_cn}-g"):
+                raise BootRegistrationError("DEVICE_CERTIFICATE_CN_MISMATCH")
+            document = json.loads(self._sample_bytes(sample).decode("utf-8"))
+            if (not isinstance(document, dict)
+                    or set(document) != {"version", "device_id", "boot_id"}
+                    or document.get("version") != 1
+                    or document.get("device_id") != device_id):
+                raise BootRegistrationError("MALFORMED_BOOT_REQUEST")
+            challenge = self.boot_registration.issue_challenge(
+                device_id=device_id,
+                boot_id=document["boot_id"],
+            )
+            self.session.put(
+                boot_topic("challenge", device_id),
+                canonical_json(challenge),
+            )
+        except Exception as exc:
+            logger.warning("[V6 BOOT] challenge request rejected: %s", sanitize(exc, 160))
+            if device_id:
+                self._publish_boot_result(device_id, {
+                    "version": 1,
+                    "ok": False,
+                    "device_id": device_id,
+                    "reason": getattr(exc, "reason_code", "BOOT_CHALLENGE_REJECTED"),
+                })
+
+    def _on_boot_proof(self, sample) -> None:
+        device_id = ""
+        try:
+            key = str(sample.key_expr)
+            device_id = self._boot_route_device(key, "proof")
+            proof = json.loads(self._sample_bytes(sample).decode("utf-8"))
+            result = self.boot_registration.complete_registration(
+                proof,
+                expected_device_id=device_id,
+                source_type="live_validated",
+            )
+            self._publish_boot_result(device_id, result)
+            logger.info(
+                "[V6 BOOT REGISTERED] device=%s generation=%s boot_id=%s",
+                sanitize(device_id, 64), result["generation"], result["boot_id"],
+            )
+        except Exception as exc:
+            logger.warning("[V6 BOOT] registration proof rejected: %s", sanitize(exc, 160))
+            if device_id:
+                self._publish_boot_result(device_id, {
+                    "version": 1,
+                    "ok": False,
+                    "device_id": device_id,
+                    "reason": getattr(exc, "reason_code", "BOOT_REGISTRATION_REJECTED"),
+                })
 
     def _on_policy_command(self, sample) -> None:
         """Apply idempotent PEP commands with a fail-closed staged release.
@@ -799,6 +901,46 @@ class ZenohInlineGateway:
         })
         return counters
 
+    def _write_ready_marker(self) -> None:
+        """Publish an atomic readiness marker only after all boot subscribers exist."""
+        marker = os.environ.get("LUMEN_GATEWAY_READY_FILE", "").strip()
+        if not marker:
+            return
+        path = Path(marker).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "status": "READY",
+            "run_id": self.run_id,
+            "pid": os.getpid(),
+            "ready_at_ns": time.time_ns(),
+            "boot_topics": {
+                "request_subscriber": BOOT_REQUEST_PREFIX + "**",
+                "proof_subscriber": BOOT_PROOF_PREFIX + "**",
+                "challenge_publisher_prefix": BOOT_CHALLENGE_PREFIX,
+                "result_publisher_prefix": BOOT_RESULT_PREFIX,
+            },
+        }
+        temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("[GATEWAY READY] unable to clean temporary readiness marker")
+
+    def _remove_ready_marker(self) -> None:
+        marker = os.environ.get("LUMEN_GATEWAY_READY_FILE", "").strip()
+        if marker:
+            try:
+                Path(marker).expanduser().resolve().unlink(missing_ok=True)
+            except OSError:
+                logger.exception("[GATEWAY READY] unable to remove readiness marker")
+
     def _write_metrics(self) -> None:
         snapshot = self._metrics_snapshot()
         try:
@@ -841,10 +983,19 @@ class ZenohInlineGateway:
                 except Exception:
                     logger.exception("[GATEWAY SHUTDOWN] policy subscriber undeclare failed")
                 self.policy_sub = None
+            for attr in ("boot_request_sub", "boot_proof_sub"):
+                sub = getattr(self, attr, None)
+                if sub is not None:
+                    try:
+                        sub.undeclare()
+                    except Exception:
+                        logger.exception("[GATEWAY SHUTDOWN] %s undeclare failed", attr)
+                    setattr(self, attr, None)
             if self.worker_thread is not None:
                 self.worker_thread.join(timeout=10.0)
                 if self.worker_thread.is_alive():
                     logger.error("[GATEWAY SHUTDOWN] worker did not drain within 10 seconds")
+            self._remove_ready_marker()
             self._write_metrics()
             try:
                 self.storage.flush_all()
@@ -866,11 +1017,21 @@ class ZenohInlineGateway:
             self.policy_sub = self.session.declare_subscriber(
                 POLICY_CONTROL_TOPIC, self._on_policy_command
             )
+            self.boot_request_sub = self.session.declare_subscriber(
+                BOOT_REQUEST_PREFIX + "**", self._on_boot_request
+            )
+            self.boot_proof_sub = self.session.declare_subscriber(
+                BOOT_PROOF_PREFIX + "**", self._on_boot_proof
+            )
             logger.info(
-                "[GATEWAY READY] run_id=%s listening=ingest/** policy=%s device_aware=true pep=true",
+                "[GATEWAY READY] run_id=%s listening=ingest/** policy=%s boot_registration=true device_aware=true pep=true",
                 self.run_id,
                 POLICY_CONTROL_TOPIC,
             )
+            # The launcher waits on this marker before starting virtual sensors
+            # or executing the live smoke. It is written only after the Zenoh
+            # boot request/proof subscribers have successfully been declared.
+            self._write_ready_marker()
             self._write_metrics()
             while self.running:
                 time.sleep(METRICS_INTERVAL_SEC)

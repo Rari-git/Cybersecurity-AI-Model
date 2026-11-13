@@ -199,3 +199,59 @@ def test_run_all_preflight_fails_closed_on_weakened_router_override(tmp_path, mo
 
     with pytest.raises(SystemExit, match="default_permission: deny"):
         run_all.preflight_or_exit()
+
+
+def test_live_smoke_reserves_gas_sensor_identity_from_background_simulator(monkeypatch):
+    import run_all
+
+    envs = {"Virtual Sensors": {"LUMEN_SIM_SKIP_DEVICES": "pir_sensor_01"}}
+    live = run_all.build_child_env(
+        "Virtual Sensors",
+        envs,
+        {"PATH": "test-path", "LUMEN_RUN_LIVE_SMOKE": "1", "LUMEN_SIM_SKIP_DEVICES": "door_sensor_01"},
+    )
+    assert set(live["LUMEN_SIM_SKIP_DEVICES"].split(",")) == {
+        "door_sensor_01", "gas_sensor_01", "pir_sensor_01",
+    }
+
+    normal = run_all.build_child_env(
+        "Virtual Sensors",
+        envs,
+        {"PATH": "test-path", "LUMEN_RUN_LIVE_SMOKE": "0"},
+    )
+    assert normal["LUMEN_SIM_SKIP_DEVICES"] == "pir_sensor_01"
+
+
+def test_gateway_ready_marker_waits_for_exact_boot_subscriber_contract(tmp_path):
+    import run_all
+
+    marker = tmp_path / "gateway_ready.json"
+    marker.write_text(json.dumps({
+        "status": "READY",
+        "run_id": "test-run",
+        "boot_topics": {
+            "request_subscriber": "control/boot/request/**",
+            "proof_subscriber": "control/boot/proof/**",
+            "challenge_publisher_prefix": "control/boot/challenge/",
+            "result_publisher_prefix": "control/boot/result/",
+        },
+    }), encoding="utf-8")
+    ready = run_all.wait_for_gateway_ready_marker(marker, timeout=0.1)
+    assert ready["run_id"] == "test-run"
+
+
+def test_gateway_ready_marker_rejects_wrong_boot_topic_contract(tmp_path):
+    import run_all
+
+    marker = tmp_path / "gateway_ready.json"
+    marker.write_text(json.dumps({
+        "status": "READY",
+        "boot_topics": {
+            "request_subscriber": "control/boot/requests/**",
+            "proof_subscriber": "control/boot/proof/**",
+            "challenge_publisher_prefix": "control/boot/challenge/",
+            "result_publisher_prefix": "control/boot/result/",
+        },
+    }), encoding="utf-8")
+    with pytest.raises(TimeoutError, match="did not become ready"):
+        run_all.wait_for_gateway_ready_marker(marker, timeout=0.15)

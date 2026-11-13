@@ -7,6 +7,7 @@ its TLS certificate or generation-bound ACL changes.
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import shutil
@@ -365,8 +366,15 @@ def build_window_env(authority: KeyAuthority, cert_authority: CertAuthority, pro
     def client(identity: str) -> dict[str, str]:
         return {**public_base, "LUMEN_CERT_IDENTITY": identity}
 
+    gateway_ready_file = authority.session_dir / "gateway_ready.json"
+    gateway_ready_file.parent.mkdir(parents=True, exist_ok=True)
+    gateway_ready_file.unlink(missing_ok=True)
+
     return {
-        "Inline Gateway": client("gateway"),
+        "Inline Gateway": {
+            **client("gateway"),
+            "LUMEN_GATEWAY_READY_FILE": str(gateway_ready_file.resolve()),
+        },
         "IDS Agent AI": {**client("ids"), **ids_model_env},
         "Honeypot Sink": client("honeypot"),
         "Virtual Sensors": {
@@ -402,6 +410,26 @@ def build_child_env(title: str, envs: dict[str, dict[str, str]],
         child_env.pop("LUMEN_MODEL_BUNDLE_DIR", None)
         child_env.pop("LUMEN_ALLOW_EXPLICIT_MODEL_BUNDLE", None)
         child_env["LUMEN_ALLOW_UNBUNDLED_FALLBACK"] = "0"
+    if title == "Virtual Sensors" and child_env.get("LUMEN_RUN_LIVE_SMOKE", "0") == "1":
+        # The live smoke opens a dedicated mTLS session for gas_sensor_01 and
+        # registers a fresh boot epoch to test sequence/replay handling. Keep
+        # the background simulator from concurrently registering/publishing
+        # the same identity, which would intentionally supersede that epoch.
+        # Preserve both inherited and managed skip lists rather than allowing
+        # one environment layer to silently discard the other.
+        inherited = parent_env or os.environ
+        skipped = {
+            item.strip()
+            for source in (
+                inherited.get("LUMEN_SIM_SKIP_DEVICES", ""),
+                envs.get(title, {}).get("LUMEN_SIM_SKIP_DEVICES", ""),
+                child_env.get("LUMEN_SIM_SKIP_DEVICES", ""),
+            )
+            for item in source.split(",")
+            if item.strip()
+        }
+        skipped.add("gas_sensor_01")
+        child_env["LUMEN_SIM_SKIP_DEVICES"] = ",".join(sorted(skipped))
     if title == "Meniu Atacuri":
         child_env["LUMEN_ATTACK_PREFIX"] = "ingest"
     return child_env
@@ -485,6 +513,31 @@ class RouterSupervisor:
         self._stop_process()
 
 
+def wait_for_gateway_ready_marker(path: str | Path, timeout: float = 90.0) -> dict:
+    """Wait until Gateway has declared its authenticated boot subscribers."""
+    ready_path = Path(path).expanduser().resolve()
+    required = {
+        "request_subscriber": "control/boot/request/**",
+        "proof_subscriber": "control/boot/proof/**",
+        "challenge_publisher_prefix": "control/boot/challenge/",
+        "result_publisher_prefix": "control/boot/result/",
+    }
+    deadline = time.monotonic() + timeout
+    last_error = "marker not created yet"
+    while time.monotonic() < deadline:
+        try:
+            document = json.loads(ready_path.read_text(encoding="utf-8"))
+            if document.get("status") == "READY" and document.get("boot_topics") == required:
+                return document
+            last_error = f"unexpected Gateway readiness marker: {document!r}"
+        except FileNotFoundError:
+            last_error = "Gateway readiness marker not created yet"
+        except (OSError, json.JSONDecodeError) as exc:
+            last_error = f"invalid Gateway readiness marker: {exc}"
+        time.sleep(0.1)
+    raise TimeoutError(f"Gateway boot subscribers did not become ready within {timeout:.1f}s: {last_error}")
+
+
 def _client_processes(project_dir: Path):
     py = sys.executable
     return [
@@ -543,6 +596,17 @@ def launch_and_arrange_grid() -> int:
             )
             processes.append((title, process))
             log.info("launched %s pid=%s", title, process.pid)
+            if title == "Inline Gateway":
+                ready_file = envs["Inline Gateway"].get("LUMEN_GATEWAY_READY_FILE")
+                if not ready_file:
+                    raise RuntimeError("Gateway readiness marker path was not provisioned")
+                ready_timeout = float(os.environ.get("LUMEN_GATEWAY_READY_TIMEOUT_SEC", "90"))
+                ready = wait_for_gateway_ready_marker(ready_file, timeout=ready_timeout)
+                log.info(
+                    "[GATEWAY READY BARRIER] run_id=%s boot_request=%s boot_proof=%s",
+                    ready.get("run_id"), ready["boot_topics"]["request_subscriber"],
+                    ready["boot_topics"]["proof_subscriber"],
+                )
 
         if os.environ.get("LUMEN_RUN_LIVE_SMOKE", "0") == "1":
             # Exercise the actual mTLS/Zenoh route only after Router, Gateway,
@@ -557,9 +621,11 @@ def launch_and_arrange_grid() -> int:
                 "LUMEN_CERT_IDENTITY": "ids",
                 "LUMEN_CERT_ALLOWED_IDENTITIES": "ids,gas_sensor_01,gas_sensor_02",
                 "LUMEN_ENV": "production",
+                "LUMEN_BOOT_REGISTRATION_TIMEOUT_SEC": os.environ.get("LUMEN_BOOT_REGISTRATION_TIMEOUT_SEC", "60"),
+                "LUMEN_BOOT_REGISTRATION_RETRY_SEC": os.environ.get("LUMEN_BOOT_REGISTRATION_RETRY_SEC", "0.25"),
             })
             log.warning("[LIVE SMOKE] running real mTLS/Zenoh envelope + PEP ACK verification")
-            smoke_timeout = float(os.environ.get("LUMEN_LIVE_SMOKE_PROCESS_TIMEOUT_SEC", "90"))
+            smoke_timeout = float(os.environ.get("LUMEN_LIVE_SMOKE_PROCESS_TIMEOUT_SEC", "180"))
             completed = subprocess.run(
                 [sys.executable, str(project_dir / "scripts" / "live_runtime_smoke.py")],
                 cwd=str(project_dir),

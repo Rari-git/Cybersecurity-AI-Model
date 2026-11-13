@@ -9,6 +9,7 @@ Caracteristici:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -58,6 +59,7 @@ class TemporalLSTMAutoencoder(nn.Module):
 def _extract_windows_by_session(
     db_dir: str | Path,
     seq_len: int = 16,
+    eligible_session_ids: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[
     dict[str, list[tuple[str, str, np.ndarray]]],
     dict[str, dict[tuple[str, str], list[float]]],
@@ -68,12 +70,25 @@ def _extract_windows_by_session(
     storage = LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=False)
     ro = storage.connect_readonly("normal")
     try:
-        sessions = [
-            r["session_id"]
-            for r in ro.execute(
-                "SELECT session_id FROM baseline_sessions WHERE approved_for_training = 1 ORDER BY started_at_ns ASC"
-            ).fetchall()
-        ]
+        eligible_rows = ro.execute(
+            """SELECT s.session_id, c.status, c.decision_json, c.dataset_sha256
+               FROM baseline_sessions s
+               JOIN session_curation c ON c.session_id=s.session_id
+               WHERE s.approved_for_training=1 AND s.source_type='baseline_lab'
+                 AND c.status='approved_clean_baseline'
+               ORDER BY s.started_at_ns ASC"""
+        ).fetchall()
+        approved_ids = [str(r["session_id"]) for r in eligible_rows]
+        curation_by_id = {str(row["session_id"]): row for row in eligible_rows}
+        if eligible_session_ids is not None:
+            requested = list(dict.fromkeys(str(value) for value in eligible_session_ids))
+            missing = sorted(set(requested) - set(approved_ids))
+            if missing:
+                raise ValueError(f"requested training sessions are not curated approved_clean_baseline sessions: {missing}")
+            requested_set = set(requested)
+            sessions = [sid for sid in approved_ids if sid in requested_set]
+        else:
+            sessions = approved_ids
         if len(sessions) < 2:
             raise RuntimeError(
                 f"Need at least 2 approved baseline sessions for train/val split, found {len(sessions)}. "
@@ -88,13 +103,40 @@ def _extract_windows_by_session(
         for sid in sessions:
             rows = ro.execute(
                 """
-                SELECT device_id, topic, gateway_ts_ns, raw_payload, numeric_value
+                SELECT event_id, device_id, generation, topic, gateway_ts_ns,
+                       payload_sha256, raw_payload, numeric_value
                 FROM raw_events
                 WHERE session_id = ?
                 ORDER BY device_id ASC, topic ASC, event_id ASC
                 """,
                 (sid,),
             ).fetchall()
+
+            # Do not trust the boolean alone: verify the immutable curation
+            # decision and its content digest every time training reads a session.
+            curation = curation_by_id[sid]
+            decision = json.loads(str(curation["decision_json"]))
+            if (decision.get("approved") is not True
+                    or decision.get("status") != "approved_clean_baseline"
+                    or decision.get("reasons") not in ([], ())):
+                raise ValueError(f"session {sid} has an invalid clean-baseline curation decision")
+            digest = hashlib.sha256()
+
+            # Curation hashes records in event_id order.
+            # Reproduce that exact canonical ordering during training.
+            digest_rows = sorted(rows, key=lambda row: int(row["event_id"]))
+
+            for row in digest_rows:
+                numeric = row["numeric_value"]
+                digest_fields = (
+                    int(row["event_id"]), str(row["device_id"]), int(row["generation"]),
+                    str(row["topic"]), int(row["gateway_ts_ns"]), bytes(row["payload_sha256"]).hex(),
+                    None if numeric is None else float(numeric), str(row["raw_payload"]),
+                )
+                digest.update(json.dumps(digest_fields, separators=(",", ":"), ensure_ascii=True).encode())
+                digest.update(b"\n")
+            if not curation["dataset_sha256"] or digest.hexdigest() != str(curation["dataset_sha256"]):
+                raise ValueError(f"session {sid} clean-baseline dataset digest mismatch")
 
             extractor = DeviceTopicFeatureExtractor(seq_len=seq_len, stat_window=seq_len)
             last_ts: dict[tuple[str, str], int] = {}
@@ -136,6 +178,30 @@ def _extract_windows_by_session(
         ro.close()
 
 
+def _load_curation_digests(db_dir: str | Path, session_ids: list[str] | tuple[str, ...]) -> dict[str, str]:
+    """Return immutable curation digests for the exact sessions in a candidate."""
+    storage = LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=False)
+    ro = storage.connect_readonly("normal")
+    try:
+        ids = tuple(dict.fromkeys(str(value) for value in session_ids))
+        if not ids:
+            raise ValueError("no curated sessions provided for candidate provenance")
+        placeholders = ",".join("?" for _ in ids)
+        rows = ro.execute(
+            f"""SELECT session_id, status, dataset_sha256 FROM session_curation
+                WHERE session_id IN ({placeholders})""",
+            ids,
+        ).fetchall()
+        result = {str(row["session_id"]): str(row["dataset_sha256"] or "") for row in rows}
+        if set(result) != set(ids) or any(not value for value in result.values()):
+            raise ValueError("candidate session is missing a clean curation digest")
+        if any(str(row["status"]) != "approved_clean_baseline" for row in rows):
+            raise ValueError("candidate session is not an approved clean baseline")
+        return result
+    finally:
+        ro.close()
+
+
 def compute_cusum_baselines(
     raw_values_by_session: dict[str, dict[tuple[str, str], list[float]]],
     training_session_ids: list[str] | tuple[str, ...],
@@ -168,6 +234,9 @@ def train_and_export_bundle(
     lr: float = 2e-3,
     seed: int = 42,
     run_id: str | None = None,
+    eligible_session_ids: list[str] | tuple[str, ...] | None = None,
+    heldout_session_ids: list[str] | tuple[str, ...] = (),
+    sign_bundle: bool = True,
 ) -> dict:
     run_id = run_id or uuid.uuid4().hex
     if bundle_dir is None:
@@ -175,10 +244,19 @@ def train_and_export_bundle(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    windows_by_session, raw_values_by_session = _extract_windows_by_session(db_dir, seq_len=seq_len)
+    windows_by_session, raw_values_by_session = _extract_windows_by_session(
+        db_dir, seq_len=seq_len, eligible_session_ids=eligible_session_ids
+    )
     session_ids = list(windows_by_session.keys())
-    train_sessions = session_ids[:-1]
-    val_sessions = [session_ids[-1]]
+    heldout_sessions = list(dict.fromkeys(str(value) for value in heldout_session_ids))
+    missing_holdout = sorted(set(heldout_sessions) - set(session_ids))
+    if missing_holdout:
+        raise ValueError(f"held-out sessions are not curated approved baseline sessions: {missing_holdout}")
+    fit_sessions = [sid for sid in session_ids if sid not in set(heldout_sessions)]
+    if len(fit_sessions) < 2:
+        raise RuntimeError("Need at least 2 non-heldout curated sessions for training/calibration.")
+    train_sessions = fit_sessions[:-1]
+    val_sessions = [fit_sessions[-1]]
 
     train_items = [item for sid in train_sessions for item in windows_by_session[sid]]
     val_items = [item for sid in val_sessions for item in windows_by_session[sid]]
@@ -240,6 +318,8 @@ def train_and_export_bundle(
 
     norm_err = last_step_abs_err / xai_scales
     val_scores = np.mean(norm_err, axis=1)
+    validation_p95 = float(np.percentile(val_scores, 95))
+    validation_p99 = float(np.percentile(val_scores, 99))
 
     global_threshold = float(np.percentile(val_scores, 98.0) * 1.25)
     stream_scores: dict[str, list[float]] = {}
@@ -258,6 +338,8 @@ def train_and_export_bundle(
     # The held-out validation session contributes only reconstruction-threshold
     # calibration below; it cannot change the CUSUM baseline statistics.
     cusum_baselines = compute_cusum_baselines(raw_values_by_session, train_sessions)
+    candidate_session_ids = train_sessions + val_sessions + heldout_sessions
+    curation_digests = _load_curation_digests(db_dir, candidate_session_ids)
 
     bdir = Path(bundle_dir).resolve()
     bdir.mkdir(parents=True, exist_ok=True)
@@ -301,6 +383,35 @@ def train_and_export_bundle(
         encoding="utf-8",
     )
 
+    metadata = {
+        "model_version": f"v6-candidate-{run_id}" if not sign_bundle else f"v5-candidate-{run_id}",
+        "architecture": "TemporalLSTMAutoencoder(12->32->16->32->12)",
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "trained_at_unix": int(time.time()),
+        "train_sessions": train_sessions,
+        "val_sessions": val_sessions,
+        "heldout_sessions": heldout_sessions,
+        "cusum_calibration_sessions": train_sessions,
+        "train_windows": len(X_train),
+        "val_windows": len(X_val_clean),
+        "final_train_loss": round(final_train_loss, 6),
+        "global_threshold": round(global_threshold, 6),
+        "validation_normal_error_p95": round(validation_p95, 8),
+        "validation_normal_error_p99": round(validation_p99, 8),
+        "dataset_policy": "approved_clean_baseline_only",
+        "offline_training": True,
+        "curation_digests": curation_digests,
+    }
+    (bdir / "manifest.json").write_text(
+        json.dumps(metadata, sort_keys=True, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+
+    if not sign_bundle:
+        # Candidate remains unsigned until offline shadow evaluation passes.
+        # The separate authority worker is the only caller allowed to sign it.
+        return {**metadata, "candidate_dir": str(bdir), "signed": False}
+
     kdir = Path(key_dir).resolve()
     priv_key = kdir / "model_signing_ed25519.key"
     pub_key = kdir / "model_signing_ed25519.pub"
@@ -309,25 +420,8 @@ def train_and_export_bundle(
             "Model signing keypair is not provisioned. Create it offline; "
             "training must never replace the runtime trust anchor automatically."
         )
+    return sign_model_bundle(bdir, priv_key, metadata=metadata)
 
-    manifest = sign_model_bundle(
-        bdir,
-        priv_key,
-        metadata={
-            "model_version": f"v5-candidate-{run_id}",
-            "architecture": "TemporalLSTMAutoencoder(12->32->16->32->12)",
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
-            "trained_at_unix": int(time.time()),
-            "train_sessions": train_sessions,
-            "val_sessions": val_sessions,
-            "cusum_calibration_sessions": train_sessions,
-            "train_windows": len(X_train),
-            "val_windows": len(X_val_clean),
-            "final_train_loss": round(final_train_loss, 6),
-            "global_threshold": round(global_threshold, 6),
-        },
-    )
-    return manifest
 
 
 if __name__ == "__main__":
@@ -338,6 +432,8 @@ if __name__ == "__main__":
     parser.add_argument("--key-dir", default="config/model_keys")
     parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--seq-len", type=int, default=16)
+    parser.add_argument("--unsigned-candidate", action="store_true",
+                        help="Write an unsigned local candidate for the separate promotion authority")
     args = parser.parse_args()
 
     res = train_and_export_bundle(
@@ -346,5 +442,6 @@ if __name__ == "__main__":
         key_dir=args.key_dir,
         seq_len=args.seq_len,
         epochs=args.epochs,
+        sign_bundle=not args.unsigned_candidate,
     )
-    print(f"[E5 MODEL BUNDLE SIGNED] version={res['model_version']} threshold={res['global_threshold']} train_win={res['train_windows']} val_win={res['val_windows']}")
+    print(json.dumps(res, indent=2, sort_keys=True))

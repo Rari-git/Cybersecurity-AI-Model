@@ -263,6 +263,32 @@ def test_training_extracts_session_scoped_values_and_preserves_compressed_cadenc
         ],
     }
 
+    import json
+    from training.dataset_governance import _dataset_digest
+
+    rows_by_session = {}
+    curation_rows = []
+    for session_id, session_events in events.items():
+        normalized = []
+        for event_id, event in enumerate(session_events, start=1):
+            raw = event["raw_payload"].encode("utf-8")
+            normalized.append({
+                **event,
+                "event_id": event_id,
+                "generation": 1,
+                "payload_sha256": hashlib.sha256(raw).digest(),
+            })
+        rows_by_session[session_id] = normalized
+        decision = {
+            "approved": True, "status": "approved_clean_baseline", "reasons": [],
+        }
+        curation_rows.append({
+            "session_id": session_id,
+            "status": "approved_clean_baseline",
+            "decision_json": json.dumps(decision),
+            "dataset_sha256": _dataset_digest(normalized),
+        })
+
     class Cursor:
         def __init__(self, rows):
             self.rows = rows
@@ -271,9 +297,11 @@ def test_training_extracts_session_scoped_values_and_preserves_compressed_cadenc
 
     class ReadOnly:
         def execute(self, sql, params=()):
-            if "SELECT session_id" in sql:
-                return Cursor([{"session_id": "training"}, {"session_id": "validation"}])
-            return Cursor(events[params[0]])
+            if "JOIN session_curation" in sql:
+                return Cursor(curation_rows)
+            if "FROM raw_events" in sql:
+                return Cursor(rows_by_session[params[0]])
+            raise AssertionError(f"unexpected training SQL: {sql}")
         def close(self):
             pass
 
@@ -438,61 +466,49 @@ def test_release_handshake_requires_all_acks_before_gateway_opens(
 
 
 
-def test_live_smoke_ignores_background_sensor_traffic_and_uses_staged_release(monkeypatch):
-    import scripts.live_runtime_smoke as smoke
+def test_ids_sensor_processor_rejects_payloads_admission_gate_rejects(monkeypatch):
+    fake_ort = ModuleType("onnxruntime")
+    fake_ort.InferenceSession = object
+    fake_zenoh = ModuleType("zenoh")
+    fake_zenoh.__path__ = []
+    fake_zenoh.Session = object
+    fake_zenoh.SampleKind = SimpleNamespace(DELETE=object())
+    fake_zenoh.Priority = SimpleNamespace(REAL_TIME=1)
+    fake_handlers = ModuleType("zenoh.handlers")
+    fake_handlers.FifoChannel = object
+    fake_handlers.RingChannel = object
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setitem(sys.modules, "zenoh", fake_zenoh)
+    monkeypatch.setitem(sys.modules, "zenoh.handlers", fake_handlers)
 
-    key_01 = f"{smoke.INTERNAL_PREFIX}gas_sensor_01"
-    key_02 = f"{smoke.INTERNAL_PREFIX}gas_sensor_02"
-    fp_01 = hashlib.sha256(b"cert-01").digest()
-    fp_02 = hashlib.sha256(b"cert-02").digest()
+    from agent.ids_agent import ZenohIDSAgent
 
-    from utils.identity_envelope import IdentityEnvelope
+    class Policy:
+        def __init__(self):
+            self.evidence = []
+        def evaluate_evidence(self, evidence):
+            self.evidence.append(evidence)
+            return SimpleNamespace(action="ALERT", new_state="ACTIVE")
 
-    bg_env = IdentityEnvelope.create(
-        device_id="gas_sensor_01", generation=1,
-        certificate_common_name="gas_sensor_01-g1-11111111",
-        certificate_fingerprint=fp_01,
-        original_topic="home/sensors/gas/ppm", payload=b"312",
-        gateway_instance_id="gw-smoke",
-    )
-    smoke_env_01 = IdentityEnvelope.create(
-        device_id="gas_sensor_01", generation=1,
-        certificate_common_name="gas_sensor_01-g1-11111111",
-        certificate_fingerprint=fp_01,
-        original_topic="home/sensors/gas/ppm", payload=b"351",
-        gateway_instance_id="gw-smoke",
-    )
-    smoke_env_02 = IdentityEnvelope.create(
-        device_id="gas_sensor_02", generation=1,
-        certificate_common_name="gas_sensor_02-g1-22222222",
-        certificate_fingerprint=fp_02,
-        original_topic="home/sensors/gas/ppm", payload=b"359",
-        gateway_instance_id="gw-smoke",
-    )
+    ids = ZenohIDSAgent.__new__(ZenohIDSAgent)
+    ids.stats = {"unknown": 0}
+    ids._resolve_device_id = lambda _topic, device_id=None: device_id or "gas_sensor_01"
+    ids.policy_engine = Policy()
+    ids._publish_v5_alert = lambda **_kwargs: None
 
-    q: queue.Queue[tuple[str, bytes]] = queue.Queue()
-    q.put((key_01, bg_env.encode()))
-    q.put((key_01, smoke_env_01.encode()))
-    q.put((key_02, smoke_env_02.encode()))
-
-    active = {
-        "gas_sensor_01": SimpleNamespace(
+    for text in ("NaN", "Inf", '{"value":10}', "OPEN"):
+        # AdmissionGate rejects these values for a gas scalar; even if an
+        # untrusted/buggy envelope claims ADMITTED, IDS independently rejects.
+        ids._process_sensor(
+            GAS_TOPIC, text, 1.0, 1.0,
             device_id="gas_sensor_01", generation=1,
-            common_name="gas_sensor_01-g1-11111111",
-            certificate_fingerprint=fp_01,
-        ),
-        "gas_sensor_02": SimpleNamespace(
-            device_id="gas_sensor_02", generation=1,
-            common_name="gas_sensor_02-g1-22222222",
-            certificate_fingerprint=fp_02,
-        ),
-    }
-    allowed = {"gas_sensor_01": "home/sensors/gas/ppm", "gas_sensor_02": "home/sensors/gas/ppm"}
-    expected = {"gas_sensor_01": b"351", "gas_sensor_02": b"359"}
+            admission_status="ADMITTED", admission_reason="ADMITTED",
+            admission_numeric_value=None,
+        )
 
-    envelopes, payloads = smoke._wait_for_smoke_envelopes(q, active, allowed, expected, timeout=1.0)
-    assert payloads == expected
-    assert set(envelopes) == {"gas_sensor_01", "gas_sensor_02"}
+    assert ids.stats["unknown"] == 4
+    assert len(ids.policy_engine.evidence) == 4
+    assert all(item.deterministic_violation for item in ids.policy_engine.evidence)
 
 
 def test_policy_engine_retains_quarantine_when_release_ack_fails(tmp_path):

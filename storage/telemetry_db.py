@@ -183,6 +183,39 @@ class _SingleWriterWorker:
                 "ON policy_dimension_transitions(device_id, dimension, transition_id)"
             )
             return
+        if self.db_path.name == "telemetry_incidents.db":
+            # Additive migration for existing incident databases.
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS adversarial_regression_corpus (
+                    capture_id INTEGER PRIMARY KEY REFERENCES incident_captures(capture_id) ON DELETE CASCADE,
+                    corpus_class TEXT NOT NULL CHECK(corpus_class IN ('adversarial','hardware_fault','protocol_violation')),
+                    indexed_at_ns INTEGER NOT NULL
+                );
+                CREATE TRIGGER IF NOT EXISTS trg_incident_to_regression_corpus
+                AFTER INSERT ON incident_captures
+                BEGIN
+                  INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
+                  VALUES (NEW.capture_id,
+                    CASE WHEN NEW.capture_source='fault_lab' OR lower(coalesce(NEW.ground_truth_label,'')) LIKE '%fault%' THEN 'hardware_fault'
+                         WHEN lower(NEW.reason_code) LIKE '%replay%' OR lower(NEW.reason_code) LIKE '%sequence%'
+                           OR lower(NEW.reason_code) LIKE '%freshness%' OR lower(NEW.reason_code) LIKE '%boot%'
+                           OR lower(NEW.reason_code) LIKE '%protocol%' THEN 'protocol_violation'
+                         ELSE 'adversarial' END,
+                    CAST(strftime('%s','now') AS INTEGER)*1000000000);
+                END;
+                INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
+                SELECT capture_id,
+                  CASE WHEN capture_source='fault_lab' OR lower(coalesce(ground_truth_label,'')) LIKE '%fault%' THEN 'hardware_fault'
+                       WHEN lower(reason_code) LIKE '%replay%' OR lower(reason_code) LIKE '%sequence%'
+                         OR lower(reason_code) LIKE '%freshness%' OR lower(reason_code) LIKE '%boot%'
+                         OR lower(reason_code) LIKE '%protocol%' THEN 'protocol_violation'
+                       ELSE 'adversarial' END,
+                  CAST(strftime('%s','now') AS INTEGER)*1000000000
+                FROM incident_captures;
+                """
+            )
+            return
         if self.db_path.name != "telemetry_normal.db":
             return
         columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
@@ -209,6 +242,47 @@ class _SingleWriterWorker:
                 updated_at_ns INTEGER NOT NULL
             )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS session_curation (
+                session_id TEXT PRIMARY KEY REFERENCES baseline_sessions(session_id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('pending','approved_clean_baseline','rejected')),
+                decision_json TEXT NOT NULL,
+                dataset_sha256 TEXT,
+                curated_at_ns INTEGER NOT NULL
+            )"""
+        )
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_baseline_session_insert_approval_guard
+            BEFORE INSERT ON baseline_sessions WHEN NEW.approved_for_training = 1
+            BEGIN SELECT RAISE(ABORT, 'training approval requires approved_clean_baseline curation'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_baseline_session_update_approval_guard
+            BEFORE UPDATE OF approved_for_training ON baseline_sessions
+            WHEN NEW.approved_for_training = 1 AND (
+                NEW.source_type <> 'baseline_lab' OR NOT EXISTS (
+                    SELECT 1 FROM session_curation c WHERE c.session_id=NEW.session_id
+                    AND c.status='approved_clean_baseline'
+                )
+            )
+            BEGIN SELECT RAISE(ABORT, 'training approval requires approved_clean_baseline curation'); END;
+            CREATE TRIGGER IF NOT EXISTS trg_live_session_training_guard
+            BEFORE UPDATE OF source_type ON baseline_sessions
+            WHEN NEW.source_type='live_validated' AND NEW.approved_for_training <> 0
+            BEGIN SELECT RAISE(ABORT, 'live_validated sessions cannot be approved for training'); END;
+            """
+        )
+        # Existing V5 rows were approved by a weaker boolean-only mechanism.
+        # Revoke those approvals unless a V6 curation record exists.
+        conn.execute(
+            """UPDATE baseline_sessions SET approved_for_training=0
+               WHERE approved_for_training=1 AND (
+                   source_type <> 'baseline_lab' OR NOT EXISTS (
+                       SELECT 1 FROM session_curation c WHERE c.session_id=baseline_sessions.session_id
+                       AND c.status='approved_clean_baseline'
+                   )
+               )"""
+        )
+        return
 
     def _fail_queued_callers(self, error: BaseException) -> None:
         """Wake every queued synchronous submitter if the worker dies."""
@@ -345,8 +419,12 @@ class LumenStorageManager:
     ) -> None:
         if source_type not in {"baseline_lab", "live_validated"}:
             raise ValueError("unsupported session source_type")
-        if source_type == "live_validated" and approved_for_training:
-            raise ValueError("live_validated sessions cannot be approved for training")
+        if approved_for_training:
+            if source_type == "live_validated":
+                raise ValueError("live_validated sessions cannot be approved for training")
+            raise ValueError(
+                "sessions must pass training.dataset_governance.curate_clean_sessions before approval"
+            )
         now_ns = time.time_ns()
         cfg_json = json.dumps(config, sort_keys=True)
 
@@ -362,24 +440,76 @@ class LumenStorageManager:
 
         self._writers["normal"].submit_sync(_op)
 
-    def finalize_baseline_session(self, session_id: str, approved_for_training: bool = True) -> None:
+    def finalize_baseline_session(self, session_id: str, approved_for_training: bool = False) -> None:
+        """Close a session without granting training approval.
+
+        The legacy flag is accepted for call compatibility but deliberately
+        ignored; only the Stage B deterministic curation gate can approve data.
+        """
         now_ns = time.time_ns()
 
         def _op(conn: sqlite3.Connection) -> None:
             conn.execute(
-                """
-                UPDATE baseline_sessions
-                SET ended_at_ns = ?,
-                    approved_for_training = CASE
-                        WHEN source_type = 'baseline_lab' AND ? = 1 THEN 1
-                        ELSE 0
-                    END
-                WHERE session_id = ?
-                """,
-                (now_ns, 1 if approved_for_training else 0, session_id),
+                "UPDATE baseline_sessions SET ended_at_ns=?, approved_for_training=0 WHERE session_id=?",
+                (now_ns, session_id),
             )
 
         self._writers["normal"].submit_sync(_op)
+
+    def mark_session_curated(
+        self,
+        session_id: str,
+        status: str,
+        decision: dict[str, Any],
+        dataset_sha256: str | None = None,
+    ) -> None:
+        """Persist a curation decision and its approval atomically."""
+        if status not in {"approved_clean_baseline", "rejected", "pending"}:
+            raise ValueError("invalid session curation status")
+        decision_json = json.dumps(decision, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        now_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT source_type, ended_at_ns FROM baseline_sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown baseline session: {session_id}")
+            if status == "approved_clean_baseline" and (row[0] != "baseline_lab" or row[1] is None):
+                raise ValueError("only completed baseline_lab sessions can be approved")
+            conn.execute(
+                """INSERT INTO session_curation(session_id,status,decision_json,dataset_sha256,curated_at_ns)
+                   VALUES(?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
+                   status=excluded.status, decision_json=excluded.decision_json,
+                   dataset_sha256=excluded.dataset_sha256, curated_at_ns=excluded.curated_at_ns""",
+                (session_id, status, decision_json, dataset_sha256, now_ns),
+            )
+            conn.execute(
+                "UPDATE baseline_sessions SET approved_for_training=? WHERE session_id=?",
+                (1 if status == "approved_clean_baseline" else 0, session_id),
+            )
+
+        self._writers["normal"].submit_sync(_op, timeout=10.0)
+
+    def load_adversarial_regression_corpus(
+        self, corpus_classes: tuple[str, ...] = ("adversarial", "protocol_violation")
+    ) -> list[dict[str, Any]]:
+        allowed = {"adversarial", "hardware_fault", "protocol_violation"}
+        if not corpus_classes or not set(corpus_classes).issubset(allowed):
+            raise ValueError("invalid adversarial corpus classes")
+        conn = self.connect_readonly("incidents")
+        try:
+            placeholders = ",".join("?" for _ in corpus_classes)
+            rows = conn.execute(
+                f"""SELECT c.*, a.corpus_class FROM adversarial_regression_corpus a
+                    JOIN incident_captures c ON c.capture_id=a.capture_id
+                    WHERE a.corpus_class IN ({placeholders}) ORDER BY c.capture_id""",
+                tuple(corpus_classes),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
 
     def enqueue_normal_raw_event(self, row: tuple[Any, ...]) -> bool:
         def _op(conn: sqlite3.Connection) -> None:

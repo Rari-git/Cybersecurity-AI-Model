@@ -45,6 +45,31 @@
       { id: "in_put_pep_ack", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/pep_ack/**"] },
       { id: "in_put_policy_ctrl", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
 
+      { id: "sub_boot_request", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/request/**"] },
+      { id: "sub_boot_proof", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/proof/**"] },
+      { id: "out_put_boot_challenge", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["control/boot/challenge/**"] },
+      { id: "out_put_boot_result", messages: ["put"], flows: ["egress"], permission: "allow", key_exprs: ["control/boot/result/**"] },
+      { id: "in_put_boot_request_door_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/request/door_sensor_01"] },
+      { id: "in_put_boot_proof_door_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/proof/door_sensor_01"] },
+      { id: "sub_boot_challenge_door_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/challenge/door_sensor_01"] },
+      { id: "sub_boot_result_door_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/result/door_sensor_01"] },
+      { id: "in_put_boot_request_gas_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/request/gas_sensor_01"] },
+      { id: "in_put_boot_proof_gas_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/proof/gas_sensor_01"] },
+      { id: "sub_boot_challenge_gas_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/challenge/gas_sensor_01"] },
+      { id: "sub_boot_result_gas_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/result/gas_sensor_01"] },
+      { id: "in_put_boot_request_gas_sensor_02", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/request/gas_sensor_02"] },
+      { id: "in_put_boot_proof_gas_sensor_02", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/proof/gas_sensor_02"] },
+      { id: "sub_boot_challenge_gas_sensor_02", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/challenge/gas_sensor_02"] },
+      { id: "sub_boot_result_gas_sensor_02", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/result/gas_sensor_02"] },
+      { id: "in_put_boot_request_vibration_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/request/vibration_sensor_01"] },
+      { id: "in_put_boot_proof_vibration_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/proof/vibration_sensor_01"] },
+      { id: "sub_boot_challenge_vibration_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/challenge/vibration_sensor_01"] },
+      { id: "sub_boot_result_vibration_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/result/vibration_sensor_01"] },
+      { id: "in_put_boot_request_pir_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/request/pir_sensor_01"] },
+      { id: "in_put_boot_proof_pir_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/proof/pir_sensor_01"] },
+      { id: "sub_boot_challenge_pir_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/challenge/pir_sensor_01"] },
+      { id: "sub_boot_result_pir_sensor_01", messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/boot/result/pir_sensor_01"] },
+
       // ---- livrare (router -> client)
       { id: "out_put_ingest",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["ingest/**"] },
       { id: "out_put_home",            messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/**"] },
@@ -122,7 +147,13 @@
 
       // sondarea capcanelor, permisă tuturor nodurilor (inclusiv cele compromise)
       { rules: ["honeypot_query_in", "honeypot_reply_out"],
-        subjects: ["sensors", "controller", "actuator", "dashboard", "lab_tester"] }
+        subjects: ["sensors", "controller", "actuator", "dashboard", "lab_tester"] },
+      { rules: ["sub_boot_request", "sub_boot_proof", "out_put_boot_challenge", "out_put_boot_result"], subjects: ["gateway"] },
+      { rules: ["in_put_boot_request_door_sensor_01", "in_put_boot_proof_door_sensor_01", "sub_boot_challenge_door_sensor_01", "sub_boot_result_door_sensor_01"], subjects: ["door_sensor_01"] },
+      { rules: ["in_put_boot_request_gas_sensor_01", "in_put_boot_proof_gas_sensor_01", "sub_boot_challenge_gas_sensor_01", "sub_boot_result_gas_sensor_01"], subjects: ["gas_sensor_01"] },
+      { rules: ["in_put_boot_request_gas_sensor_02", "in_put_boot_proof_gas_sensor_02", "sub_boot_challenge_gas_sensor_02", "sub_boot_result_gas_sensor_02"], subjects: ["gas_sensor_02"] },
+      { rules: ["in_put_boot_request_vibration_sensor_01", "in_put_boot_proof_vibration_sensor_01", "sub_boot_challenge_vibration_sensor_01", "sub_boot_result_vibration_sensor_01"], subjects: ["vibration_sensor_01"] },
+      { rules: ["in_put_boot_request_pir_sensor_01", "in_put_boot_proof_pir_sensor_01", "sub_boot_challenge_pir_sensor_01", "sub_boot_result_pir_sensor_01"], subjects: ["pir_sensor_01"] },
     ]
   }
   // Fără plugins.rest (scrie/citește orice cheie prin HTTP și ocolește ACL-ul).

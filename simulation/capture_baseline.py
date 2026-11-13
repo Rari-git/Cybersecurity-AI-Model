@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
 
 from storage.telemetry_db import LumenStorageManager, DBPaths
 from storage.admission_gate import AdmissionGate, ProvenanceContext
+from training.dataset_governance import curate_clean_sessions
 
 DEFAULT_ALLOWED_TOPICS: dict[str, set[str]] = {
     "gas_sensor_01": {"home/sensors/gas/ppm"},
@@ -92,6 +93,11 @@ def run_baseline_capture(
                     "rate_hz": rate_hz,
                     "seed": seed,
                     "compressed_time": not realtime_sleep,
+                    "effective_duration_sec": (max(0, events_per_sensor - 1) / rate_hz) if not realtime_sleep else None,
+                    "expected_sensor_topics": [
+                        f"{device_id}::{next(iter(topics))}"
+                        for device_id, topics in sorted(DEFAULT_ALLOWED_TOPICS.items())
+                    ],
                 },
                 approved_for_training=False,
             )
@@ -118,7 +124,13 @@ def run_baseline_capture(
                 if realtime_sleep:
                     time.sleep(1.0 / rate_hz)
 
-            storage.finalize_baseline_session(session_id, approved_for_training=True)
+            storage.finalize_baseline_session(session_id, approved_for_training=False)
+            curate_clean_sessions(
+                storage,
+                min_duration_sec=0.0 if not realtime_sleep else max(0.0, events_per_sensor / rate_hz * 0.8),
+                min_sensor_coverage=1.0,
+                session_ids=(session_id,),
+            )
     finally:
         storage.flush_all()
         storage.close()

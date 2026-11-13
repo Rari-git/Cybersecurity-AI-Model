@@ -36,11 +36,43 @@ def _safe_relative_path(name: str) -> PurePosixPath:
     return path
 
 
+def _assert_plain_file(path: Path) -> None:
+    """Reject symlinks/reparse points and non-regular entries before opening."""
+    if _is_symlink_or_reparse(path):
+        raise ValueError(f"bundle file must not be a symlink or reparse point: {path}")
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"bundle file is not a regular file: {path}")
+
+
+def _safe_bundle_root(bundle_dir: str | os.PathLike[str]) -> Path:
+    requested = Path(bundle_dir)
+    if _is_symlink_or_reparse(requested):
+        raise ValueError(f"model bundle root must not be a symlink or reparse point: {requested}")
+    root = requested.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"model bundle root is not a directory: {root}")
+    return root
+
+
 def sha256_file(path: Path) -> str:
+    """Hash a regular file using a no-follow descriptor where supported."""
+    path = Path(path)
+    _assert_plain_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
     digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"bundle file is not a regular file: {path}")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    finally:
+        os.close(fd)
+    # Recheck after reading to detect path replacement during hashing.
+    _assert_plain_file(path)
     return digest.hexdigest()
 
 
@@ -66,12 +98,7 @@ def _artifact_files(bundle_dir: Path) -> dict[str, Path]:
     ``Path.rglob`` plus ``is_dir`` follows directory symlinks on some platforms.
     Use an explicit no-follow scandir walk and reject Windows reparse points too.
     """
-    requested_root = Path(bundle_dir)
-    if _is_symlink_or_reparse(requested_root):
-        raise ValueError(f"model bundle root must not be a symlink or reparse point: {requested_root}")
-    root = requested_root.resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError(f"model bundle root is not a directory: {root}")
+    root = _safe_bundle_root(bundle_dir)
 
     artifacts: dict[str, Path] = {}
     pending = [root]
@@ -151,7 +178,7 @@ def generate_model_signing_keypair(priv_path: Path, pub_path: Path) -> None:
 
 
 def sign_model_bundle(bundle_dir: Path, private_key_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
-    root = Path(bundle_dir).resolve(strict=True)
+    root = _safe_bundle_root(bundle_dir)
     if RESERVED_METADATA.intersection(metadata):
         raise ValueError("metadata cannot override reserved manifest fields")
     artifacts = _artifact_files(root)
@@ -192,11 +219,13 @@ class VerifiedModelBundle:
 
 
 def verify_and_load_bundle(bundle_dir: str | Path, public_key_path: str | Path) -> VerifiedModelBundle:
-    root = Path(bundle_dir).resolve(strict=True)
+    root = _safe_bundle_root(bundle_dir)
     manifest_path = root / MANIFEST_NAME
     signature_path = root / SIGNATURE_NAME
-    if not manifest_path.is_file() or not signature_path.is_file():
+    if not manifest_path.exists() or not signature_path.exists():
         raise FileNotFoundError(f"unsigned or incomplete model bundle in {root}")
+    _assert_plain_file(manifest_path)
+    _assert_plain_file(signature_path)
     public_key = serialization.load_pem_public_key(Path(public_key_path).read_bytes())
     if not isinstance(public_key, Ed25519PublicKey):
         raise TypeError("Expected Ed25519 public key for bundle verification")
@@ -242,3 +271,63 @@ def verify_and_load_bundle(bundle_dir: str | Path, public_key_path: str | Path) 
         scaler=read_json("scaler.json"),
         thresholds=read_json("thresholds.json"),
     )
+
+
+@dataclass(frozen=True)
+class UnsignedCandidateBundle:
+    bundle_dir: Path
+    metadata: dict[str, Any]
+    artifacts: tuple[str, ...]
+
+
+def validate_unsigned_candidate_bundle(bundle_dir: str | Path) -> UnsignedCandidateBundle:
+    """Validate a local, unsigned, curated-clean candidate before shadow evaluation.
+
+    This function performs no signing and does not load ONNX. It validates the
+    candidate's provenance and no-follow artifact set; runtime verification
+    remains ``verify_and_load_bundle`` after offline signing.
+    """
+    root = _safe_bundle_root(bundle_dir)
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError("candidate manifest.json is missing")
+    _assert_plain_file(manifest_path)
+    if (root / MANIFEST_NAME).exists() or (root / SIGNATURE_NAME).exists():
+        raise ValueError("candidate must remain unsigned until promotion gates pass")
+    artifacts = _artifact_files(root)
+    if "manifest.json" not in artifacts:
+        raise ValueError("candidate manifest must be a regular hashed artifact")
+    try:
+        metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("candidate manifest.json is invalid") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("candidate manifest must be a JSON object")
+    if metadata.get("offline_training") is not True:
+        raise ValueError("candidate was not produced by the offline training pipeline")
+    if metadata.get("dataset_policy") != "approved_clean_baseline_only":
+        raise ValueError("candidate dataset policy is not approved_clean_baseline_only")
+    train = metadata.get("train_sessions")
+    validation = metadata.get("val_sessions")
+    heldout = metadata.get("heldout_sessions")
+    cusum = metadata.get("cusum_calibration_sessions")
+    for label, value in (("train_sessions", train), ("val_sessions", validation),
+                         ("heldout_sessions", heldout), ("cusum_calibration_sessions", cusum)):
+        if not isinstance(value, list) or not value or any(not isinstance(item, str) or not item for item in value):
+            raise ValueError(f"candidate {label} must be a non-empty list of session IDs")
+    if set(train) & set(validation) or set(train) & set(heldout) or set(validation) & set(heldout):
+        raise ValueError("training, validation and held-out sessions must be disjoint")
+    if not set(cusum).issubset(set(train)):
+        raise ValueError("CUSUM calibration may use training sessions only")
+    curation_digests = metadata.get("curation_digests")
+    required_session_ids = set(train) | set(validation) | set(heldout)
+    if not isinstance(curation_digests, dict) or set(curation_digests) != required_session_ids:
+        raise ValueError("candidate must bind every train/validation/held-out session to its curation digest")
+    if any(not isinstance(value, str) or len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value.lower())
+           for value in curation_digests.values()):
+        raise ValueError("candidate curation digests must be lowercase SHA-256 hex strings")
+    if not isinstance(metadata.get("global_threshold"), (int, float)) or metadata["global_threshold"] <= 0:
+        raise ValueError("candidate global_threshold must be positive")
+    if not isinstance(metadata.get("validation_normal_error_p95"), (int, float)):
+        raise ValueError("candidate validation normal error metric is missing")
+    return UnsignedCandidateBundle(root, metadata, tuple(sorted(artifacts)))

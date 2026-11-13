@@ -229,3 +229,72 @@ def parse_sensor_frame(
         )
     except (UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return SensorFrameResult(False, None, str(exc)[:160])
+
+
+
+def encode_sensor_frame(
+    *,
+    device_id: str,
+    boot_id: str,
+    sequence: int,
+    device_timestamp_ns: int,
+    topic: str,
+    payload: bytes | str | int | float,
+) -> bytes:
+    """Encode a canonical V6 sensor frame using the existing V5 schema."""
+
+    if not isinstance(device_id, str) or not _DEVICE_ID_RE.fullmatch(device_id):
+        raise ValueError("invalid frame device_id")
+
+    canonical_boot_id = normalize_boot_id(boot_id)
+
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or not 1 <= sequence <= MAX_SEQUENCE
+    ):
+        raise ValueError("sequence must be a positive signed 64-bit integer")
+
+    if (
+        isinstance(device_timestamp_ns, bool)
+        or not isinstance(device_timestamp_ns, int)
+        or not 1 <= device_timestamp_ns <= MAX_DEVICE_TIMESTAMP_NS
+    ):
+        raise ValueError("device_timestamp_ns must be a positive signed 64-bit integer")
+
+    if isinstance(payload, bytes):
+        try:
+            payload_text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("INVALID_UTF8_PAYLOAD") from exc
+    elif isinstance(payload, bool) or not isinstance(payload, (str, int, float)):
+        raise ValueError("unsupported sensor payload type")
+    elif isinstance(payload, float) and not math.isfinite(payload):
+        raise ValueError("sensor payload must be finite")
+    else:
+        payload_text = str(payload)
+
+    parsed = parse_sensor_payload(topic, payload_text)
+    if not parsed.valid:
+        raise ValueError(parsed.reason)
+
+    document = {
+        "protocol_version": 6,
+        "device_id": device_id,
+        "boot_id": canonical_boot_id,
+        "sequence": sequence,
+        "device_timestamp_ns": device_timestamp_ns,
+        "payload": parsed.canonical_text,
+    }
+
+    encoded = json.dumps(
+        document,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    if len(encoded) > MAX_SENSOR_FRAME_BYTES:
+        raise ValueError("INVALID_FRAME_SIZE")
+
+    return encoded

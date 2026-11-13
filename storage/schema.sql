@@ -20,6 +20,44 @@ CREATE TABLE IF NOT EXISTS baseline_sessions (
     CHECK(source_type <> 'live_validated' OR approved_for_training = 0)
 );
 
+
+-- V6 Stage B: a session may enter normal training only after a deterministic
+-- curation decision. `live_validated` is never eligible, regardless of caller.
+CREATE TABLE IF NOT EXISTS session_curation (
+    session_id TEXT PRIMARY KEY REFERENCES baseline_sessions(session_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'approved_clean_baseline', 'rejected')),
+    decision_json TEXT NOT NULL,
+    dataset_sha256 TEXT,
+    curated_at_ns INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_baseline_session_insert_approval_guard
+BEFORE INSERT ON baseline_sessions
+WHEN NEW.approved_for_training = 1
+BEGIN
+    SELECT RAISE(ABORT, 'training approval requires approved_clean_baseline curation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_baseline_session_update_approval_guard
+BEFORE UPDATE OF approved_for_training ON baseline_sessions
+WHEN NEW.approved_for_training = 1 AND (
+    NEW.source_type <> 'baseline_lab'
+    OR NOT EXISTS (
+        SELECT 1 FROM session_curation c
+        WHERE c.session_id = NEW.session_id AND c.status = 'approved_clean_baseline'
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'training approval requires approved_clean_baseline curation');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_live_session_training_guard
+BEFORE UPDATE OF source_type ON baseline_sessions
+WHEN NEW.source_type = 'live_validated' AND NEW.approved_for_training <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'live_validated sessions cannot be approved for training');
+END;
+
 CREATE TABLE IF NOT EXISTS raw_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -115,6 +153,37 @@ CREATE INDEX IF NOT EXISTS idx_incidents_dev_ts
     ON incident_captures(device_id, gateway_ts_ns);
 CREATE INDEX IF NOT EXISTS idx_incidents_scenario
     ON incident_captures(scenario_id, capture_source);
+
+
+-- Incident/forensic material is indexed separately as an adversarial regression
+-- corpus. It is never joined into telemetry_normal.raw_events or clean training.
+CREATE TABLE IF NOT EXISTS adversarial_regression_corpus (
+    capture_id INTEGER PRIMARY KEY REFERENCES incident_captures(capture_id) ON DELETE CASCADE,
+    corpus_class TEXT NOT NULL CHECK(corpus_class IN ('adversarial', 'hardware_fault', 'protocol_violation')),
+    indexed_at_ns INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_incident_to_regression_corpus
+AFTER INSERT ON incident_captures
+BEGIN
+    INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id, corpus_class, indexed_at_ns)
+    VALUES (
+        NEW.capture_id,
+        CASE
+            WHEN NEW.capture_source = 'fault_lab'
+                 OR lower(coalesce(NEW.ground_truth_label, '')) LIKE '%fault%'
+                THEN 'hardware_fault'
+            WHEN lower(NEW.reason_code) LIKE '%replay%'
+                 OR lower(NEW.reason_code) LIKE '%sequence%'
+                 OR lower(NEW.reason_code) LIKE '%freshness%'
+                 OR lower(NEW.reason_code) LIKE '%boot%'
+                 OR lower(NEW.reason_code) LIKE '%protocol%'
+                THEN 'protocol_violation'
+            ELSE 'adversarial'
+        END,
+        CAST(strftime('%s','now') AS INTEGER) * 1000000000
+    );
+END;
 
 -- ============================================================================
 -- [DB: security_control]
