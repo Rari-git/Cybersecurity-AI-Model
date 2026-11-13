@@ -159,14 +159,20 @@ class AuthenticatedTelemetryEnvelope:
         gateway_fields = (gateway_identity, gateway_signing_key)
         gateway_claim_values = (None, None, None)
         if protocol_version == 6:
+            # A malformed V6 frame can still be forwarded as a signed rejection
+            # event so IDS receives structured protocol evidence. Only rejected
+            # envelopes may omit all freshness fields; partial metadata is never
+            # accepted and an admitted V6 message always requires all fields.
             if any(value is None for value in v6_fields):
-                raise ValueError("V6 envelope requires boot_id, sequence and device_timestamp_ns")
-            boot_id = normalize_boot_id(boot_id)
-            if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence <= MAX_SEQUENCE:
-                raise ValueError("sequence must be a positive signed 64-bit integer")
-            if (isinstance(device_timestamp_ns, bool) or not isinstance(device_timestamp_ns, int)
-                    or not 1 <= device_timestamp_ns <= MAX_DEVICE_TIMESTAMP_NS):
-                raise ValueError("device_timestamp_ns must be a positive signed 64-bit integer")
+                if admission_status != "REJECTED" or any(value is not None for value in v6_fields):
+                    raise ValueError("V6 envelope requires boot_id, sequence and device_timestamp_ns")
+            else:
+                boot_id = normalize_boot_id(boot_id)
+                if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence <= MAX_SEQUENCE:
+                    raise ValueError("sequence must be a positive signed 64-bit integer")
+                if (isinstance(device_timestamp_ns, bool) or not isinstance(device_timestamp_ns, int)
+                        or not 1 <= device_timestamp_ns <= MAX_DEVICE_TIMESTAMP_NS):
+                    raise ValueError("device_timestamp_ns must be a positive signed 64-bit integer")
             if any(value is None for value in gateway_fields):
                 raise ValueError("V6 envelope requires active Gateway identity and signing key")
             gateway_claim_values = _gateway_claims(gateway_identity)
@@ -275,17 +281,20 @@ class AuthenticatedTelemetryEnvelope:
         if isinstance(env.protocol_version, bool) or not isinstance(env.protocol_version, int):
             raise ValueError("invalid envelope protocol version")
         if env.protocol_version == 6:
-            if env.boot_id is None or env.sequence is None or env.device_timestamp_ns is None:
-                raise ValueError("incomplete V6 freshness metadata")
-            try:
-                normalize_boot_id(env.boot_id)
-            except ValueError as exc:
-                raise ValueError("invalid V6 boot ID") from exc
-            if isinstance(env.sequence, bool) or not isinstance(env.sequence, int) or not 1 <= env.sequence <= MAX_SEQUENCE:
-                raise ValueError("invalid V6 sequence")
-            if (isinstance(env.device_timestamp_ns, bool) or not isinstance(env.device_timestamp_ns, int)
-                    or not 1 <= env.device_timestamp_ns <= MAX_DEVICE_TIMESTAMP_NS):
-                raise ValueError("invalid V6 device timestamp")
+            v6_values = (env.boot_id, env.sequence, env.device_timestamp_ns)
+            if any(value is None for value in v6_values):
+                if env.admission_status != "REJECTED" or any(value is not None for value in v6_values):
+                    raise ValueError("incomplete V6 freshness metadata")
+            else:
+                try:
+                    normalize_boot_id(env.boot_id)
+                except ValueError as exc:
+                    raise ValueError("invalid V6 boot ID") from exc
+                if isinstance(env.sequence, bool) or not isinstance(env.sequence, int) or not 1 <= env.sequence <= MAX_SEQUENCE:
+                    raise ValueError("invalid V6 sequence")
+                if (isinstance(env.device_timestamp_ns, bool) or not isinstance(env.device_timestamp_ns, int)
+                        or not 1 <= env.device_timestamp_ns <= MAX_DEVICE_TIMESTAMP_NS):
+                    raise ValueError("invalid V6 device timestamp")
             if (
                 not isinstance(env.gateway_certificate_common_name, str)
                 or not _DEVICE_ID.fullmatch(env.gateway_certificate_common_name)

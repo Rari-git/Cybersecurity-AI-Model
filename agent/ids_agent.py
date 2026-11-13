@@ -198,6 +198,7 @@ class ZenohIDSAgent:
             "faults_isolated": 0,
             "quarantines_issued": 0,
             "nonfinite": 0,
+            "protocol_rejections": 0,
         }
         self._last_stats = dict(self.stats)
 
@@ -466,6 +467,8 @@ class ZenohIDSAgent:
         device_id: str | None = None, generation: int = 1,
         admission_status: str = "ADMITTED", admission_reason: str = "LEGACY_UNVERIFIED",
         admission_numeric_value: float | None = None,
+        protocol_version: int = 5, boot_id: str | None = None,
+        sequence: int | None = None, device_timestamp_ns: int | None = None,
     ) -> None:
         payload_str = truncate_payload(payload_str)
         raw_bytes = payload_str.encode("utf-8", errors="strict")
@@ -483,7 +486,21 @@ class ZenohIDSAgent:
             reason = admission_reason if admission_status == "REJECTED" else (
                 "GATE_IDS_SCHEMA_DISAGREEMENT" if disagreement else parsed.reason
             )
-            self._record_protocol_violation(device_id, generation, key, reason)
+            self._record_protocol_violation(
+                device_id, generation, key, reason,
+                protocol_version=protocol_version,
+                boot_id=boot_id,
+                sequence=sequence,
+                device_timestamp_ns=device_timestamp_ns,
+            )
+            return
+        if protocol_version == 6 and (
+            boot_id is None or sequence is None or device_timestamp_ns is None
+        ):
+            self._record_protocol_violation(
+                device_id, generation, key, "INCOMPLETE_V6_FRESHNESS_METADATA",
+                protocol_version=6,
+            )
             return
         # Both Gateway and IDS operate on the same normalized scalar string.
         payload_str = parsed.canonical_text
@@ -562,10 +579,16 @@ class ZenohIDSAgent:
             deterministic_violation=bool(flood),
             deterministic_reason="FLOOD_RATE_VIOLATION" if flood else "",
             xai_summary=xai_report.summary_text if xai_report else f"CUSUM={cusum_res.score:.2f}",
+            protocol_version=protocol_version,
+            boot_id=boot_id,
+            sequence=sequence,
+            device_timestamp_ns=device_timestamp_ns,
         )
         decision = self.policy_engine.evaluate_evidence(evidence)
 
-        if decision.action == "ALERT_FAULT":
+        # Health and security are independent axes. One telemetry event can
+        # legitimately produce both an operational alert and a quarantine.
+        if decision.operational_status == "FAULT":
             self._publish_v5_alert(
                 device_id=device_id,
                 topic=key,
@@ -575,7 +598,17 @@ class ZenohIDSAgent:
                 detail=op_health.detail,
                 severity="medium",
             )
-        elif decision.action == "QUARANTINE_SHADOW":
+        elif decision.operational_status == "DEGRADED":
+            self._publish_v5_alert(
+                device_id=device_id,
+                topic=key,
+                attack_label="Operational Degradation",
+                action="MAINTENANCE_ALERT",
+                score=0.0,
+                detail=op_health.detail,
+                severity="low",
+            )
+        if decision.action == "QUARANTINE_SHADOW":
             self.stats["quarantines_issued"] += 1
             detail = (
                 f"{decision.reason_code} | score={lstm_score:.3f}>{lstm_thr:.3f} "
@@ -609,17 +642,31 @@ class ZenohIDSAgent:
                 severity="low",
             )
 
-    def _record_protocol_violation(self, device_id: str, generation: int, topic: str, reason: str) -> None:
+    def _record_protocol_violation(
+        self, device_id: str, generation: int, topic: str, reason: str,
+        *, protocol_version: int = 5, boot_id: str | None = None,
+        sequence: int | None = None, device_timestamp_ns: int | None = None,
+    ) -> None:
         """Keep rejected ingress out of normal features and feed explicit protocol evidence."""
         self.stats["unknown"] += 1
+        self.stats["protocol_rejections"] = self.stats.get("protocol_rejections", 0) + 1
+        op_getter = getattr(self.policy_engine, "get_operational_status", None)
+        operational_status = op_getter(device_id) if callable(op_getter) else "HEALTHY"
         evidence = DetectionEvidence(
             device_id=device_id, generation=generation, topic=topic,
             lstm_score=0.0, lstm_threshold=1.0, lstm_anomalous=False,
             cusum_score=0.0, cusum_triggered=False,
-            operational_status="HEALTHY", fault_type="NONE",
+            operational_status=operational_status,
+            fault_type="NONE",
             deterministic_violation=True,
             deterministic_reason=f"ADMISSION_REJECTED:{reason}"[:160],
             xai_summary="Gateway AdmissionGate rejected the raw sensor payload",
+            protocol_version=protocol_version,
+            boot_id=boot_id,
+            sequence=sequence,
+            device_timestamp_ns=device_timestamp_ns,
+            protocol_violation=True,
+            admission_status="REJECTED",
         )
         decision = self.policy_engine.evaluate_evidence(evidence)
         self._publish_v5_alert(
@@ -635,7 +682,8 @@ class ZenohIDSAgent:
 
     def _process_sample(self, key, payload_bytes, recv_time, delta_t, rate, device_id=None, generation=1,
                         admission_status="ADMITTED", admission_reason="LEGACY_UNVERIFIED",
-                        admission_numeric_value=None) -> None:
+                        admission_numeric_value=None, protocol_version=5, boot_id=None,
+                        sequence=None, device_timestamp_ns=None) -> None:
         payload_str = payload_bytes.decode("utf-8", errors="replace")
         if key.startswith("home/actuators"):
             self._process_actuator(key, payload_str)
@@ -643,6 +691,7 @@ class ZenohIDSAgent:
             self._process_sensor(
                 key, truncate_payload(payload_str), delta_t, rate, device_id, generation,
                 admission_status, admission_reason, admission_numeric_value,
+                protocol_version, boot_id, sequence, device_timestamp_ns,
             )
 
     def _next_item(self):
@@ -711,6 +760,7 @@ class ZenohIDSAgent:
                 self.sensor_queue.put_nowait((
                     env.original_topic, payload, now, delta_t, rate, env.device_id, env.generation,
                     env.admission_status, env.admission_reason, env.admission_numeric_value,
+                    env.protocol_version, env.boot_id, env.sequence, env.device_timestamp_ns,
                 ))
                 self.wake.set()
             except Full:

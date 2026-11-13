@@ -1,4 +1,9 @@
-"""Deterministic v5.0 risk policy with correlated PEP and restart-safe hysteresis."""
+"""V6 orthogonal operational/security policy with V5 PEP compatibility.
+
+Operational health is diagnostic/maintenance state. Security state is the
+independent trust/enforcement state. A hardware FAULT must never overwrite a
+security quarantine, clear replay evidence, or suppress a protocol violation.
+"""
 from __future__ import annotations
 
 import uuid
@@ -7,6 +12,27 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from storage.telemetry_db import LumenStorageManager
+
+
+_OPERATIONAL_STATES = frozenset({"HEALTHY", "DEGRADED", "FAULT"})
+_SECURITY_STATUS_BY_PHASE = {
+    "ACTIVE": "ACTIVE",
+    "MONITORING": "SUSPECT",
+    "ENFORCEMENT_PENDING": "QUARANTINED",
+    "SHADOW_QUARANTINE": "QUARANTINED",
+    "RECOVERY_PENDING": "QUARANTINED",
+    "ENFORCEMENT_FAILED": "QUARANTINED",
+    "REVOKED": "REVOKED",
+}
+_SECURITY_PHASE_RANK = {
+    "ACTIVE": 0,
+    "MONITORING": 1,
+    "ENFORCEMENT_PENDING": 2,
+    "ENFORCEMENT_FAILED": 3,
+    "SHADOW_QUARANTINE": 4,
+    "RECOVERY_PENDING": 5,
+    "REVOKED": 6,
+}
 
 
 @dataclass(frozen=True)
@@ -19,14 +45,21 @@ class DetectionEvidence:
     lstm_anomalous: bool
     cusum_score: float
     cusum_triggered: bool
-    operational_status: str  # 'HEALTHY' | 'FAULT'
+    operational_status: str  # 'HEALTHY' | 'DEGRADED' | 'FAULT'
     fault_type: str
     deterministic_violation: bool = False
     deterministic_reason: str = ""
     xai_summary: str = ""
-    # Cryptographic revocation is a separate, explicit decision. Behavioral
-    # violations (including rate/flood rules) never set this flag implicitly.
+    # Cryptographic revocation is a separate, explicit decision.
     revocation_requested: bool = False
+    # V6 protocol evidence is admitted to the policy layer without being fed to
+    # feature extraction/ONNX. A freshness violation is an immediate signal.
+    protocol_version: int = 5
+    boot_id: str | None = None
+    sequence: int | None = None
+    device_timestamp_ns: int | None = None
+    protocol_violation: bool = False
+    admission_status: str = "ADMITTED"
 
 
 @dataclass(frozen=True)
@@ -38,10 +71,17 @@ class PolicyDecision:
     action: str
     reason_code: str
     confirmed_by_pep: bool
+    operational_status: str = "HEALTHY"
+    security_status: str = "ACTIVE"
 
 
 class RiskPolicyEngine:
-    """Separates behavioral quarantine, maintenance FAULT, and PKI revocation."""
+    """Separate operational health from security enforcement and retain V5 PEP semantics.
+
+    ``get_state`` and PolicyDecision.old_state/new_state remain compatibility
+    views for V5 callers. New integrations should use get_operational_status()
+    and get_security_status().
+    """
 
     def __init__(
         self,
@@ -72,63 +112,206 @@ class RiskPolicyEngine:
         self.fault_recovery_clean_windows = fault_recovery_clean_windows
         self.policy_version = policy_version
 
-        self._states: dict[str, str] = {}
-        self._anomaly_hist: dict[str, deque[int]] = {}
-        self._clean_streak: dict[str, int] = {}
+        # Security phase preserves V5's detailed PEP lifecycle. It maps to the
+        # V6 public security states ACTIVE/SUSPECT/QUARANTINED/REVOKED.
+        self._security_phases: dict[str, str] = {}
+        self._operational_states: dict[str, str] = {}
+        self._security_anomaly_hist: dict[str, deque[int]] = {}
+        self._security_clean_streak: dict[str, int] = {}
+        self._operational_clean_streak: dict[str, int] = {}
         self._generations: dict[str, int] = {}
+        self._security_transition_history: dict[str, list[str]] = {}
+        self._operational_transition_history: dict[str, list[str]] = {}
+
+        # Private compatibility aliases used by existing V5 regression helpers.
+        self._states = self._security_phases
+        self._anomaly_hist = self._security_anomaly_hist
+        self._clean_streak = self._security_clean_streak
         self._restore_state()
 
+    @staticmethod
+    def _status_for_phase(phase: str) -> str:
+        return _SECURITY_STATUS_BY_PHASE.get(phase, "QUARANTINED")
+
     def _restore_state(self) -> None:
-        loader = getattr(self.storage, "load_policy_states", None)
-        if not callable(loader):
-            return
-        restored = loader()
-        # The hash-chained device_registry state is committed with every state
-        # transition. It is authoritative if a process stopped between that
-        # commit and the following hysteresis snapshot write.
-        state_loader = getattr(self.storage, "load_device_state_rows", None)
-        registry_states = state_loader() if callable(state_loader) else {}
-        for device_id, row in restored.items():
+        dimension_loader = getattr(self.storage, "load_policy_dimensions", None)
+        dimensions = dimension_loader() if callable(dimension_loader) else {}
+        legacy_loader = getattr(self.storage, "load_policy_states", None)
+        legacy = legacy_loader() if callable(legacy_loader) else {}
+        registry_loader = getattr(self.storage, "load_device_state_rows", None)
+        registry = registry_loader() if callable(registry_loader) else {}
+
+        # Restore the V6 dimensions first.
+        for device_id, row in dimensions.items():
+            try:
+                generation = int(row["generation"])
+                phase = str(row.get("security_phase", "ACTIVE"))
+                operational = str(row.get("operational_status", "HEALTHY"))
+                history = [int(v) for v in row.get("security_anomaly_history", [])][-self.window_n:]
+                if (generation < 1 or phase not in _SECURITY_STATUS_BY_PHASE
+                        or operational not in _OPERATIONAL_STATES or any(v not in (0, 1) for v in history)):
+                    continue
+                self._generations[device_id] = generation
+                self._security_phases[device_id] = phase
+                self._operational_states[device_id] = operational
+                self._security_anomaly_hist[device_id] = deque(history, maxlen=self.window_n)
+                self._security_clean_streak[device_id] = max(0, int(row.get("security_clean_streak", 0)))
+                self._operational_clean_streak[device_id] = max(0, int(row.get("operational_clean_streak", 0)))
+                self._security_transition_history[device_id] = [
+                    str(v) for v in row.get("security_transition_history", [])
+                ][-64:]
+                self._operational_transition_history[device_id] = [
+                    str(v) for v in row.get("operational_transition_history", [])
+                ][-64:]
+            except (TypeError, ValueError, KeyError):
+                continue
+
+        # Upgrade legacy V5 rows. FAULT is migrated to the operational dimension;
+        # all other legacy values remain the detailed security phase.
+        for device_id, row in legacy.items():
+            if device_id in self._security_phases:
+                continue
             try:
                 generation = int(row["generation"])
                 state = str(row["current_state"])
+                phase = "ACTIVE" if state == "FAULT" else state
+                operational = "FAULT" if state == "FAULT" else "HEALTHY"
                 history = [int(v) for v in row.get("anomaly_history", [])][-self.window_n:]
-                clean_streak = max(0, int(row.get("clean_streak", 0)))
-                registry_row = registry_states.get(device_id)
-                if registry_row and int(registry_row["generation"]) == generation:
-                    state = str(registry_row["current_state"])
-                if generation < 1 or any(v not in (0, 1) for v in history):
+                if generation < 1 or phase not in _SECURITY_STATUS_BY_PHASE or any(v not in (0, 1) for v in history):
                     continue
                 self._generations[device_id] = generation
-                self._states[device_id] = state
-                self._anomaly_hist[device_id] = deque(history, maxlen=self.window_n)
-                self._clean_streak[device_id] = clean_streak
+                self._security_phases[device_id] = phase
+                self._operational_states[device_id] = operational
+                self._security_anomaly_hist[device_id] = deque(history, maxlen=self.window_n)
+                self._security_clean_streak[device_id] = max(0, int(row.get("clean_streak", 0)))
+                self._operational_clean_streak[device_id] = 0
             except (TypeError, ValueError, KeyError):
                 continue
-        # Registry-only entries (for example, a verified certificate revocation
-        # during the last instruction before a crash) must also be restored.
-        for device_id, row in registry_states.items():
-            if device_id not in self._states:
-                self._generations[device_id] = int(row["generation"])
-                self._states[device_id] = str(row["current_state"])
-                self._anomaly_hist[device_id] = deque(maxlen=self.window_n)
-                self._clean_streak[device_id] = 0
+
+        # device_registry remains the V5 authoritative security phase. It must
+        # never override an independent V6 operational status.
+        for device_id, row in registry.items():
+            try:
+                generation = int(row["generation"])
+                registry_phase = str(row["current_state"])
+                if device_id not in self._security_phases:
+                    if registry_phase == "FAULT":
+                        phase, operational = "ACTIVE", "FAULT"
+                    elif registry_phase in _SECURITY_STATUS_BY_PHASE:
+                        phase, operational = registry_phase, "HEALTHY"
+                    else:
+                        continue
+                    self._generations[device_id] = generation
+                    self._security_phases[device_id] = phase
+                    self._operational_states[device_id] = operational
+                    self._security_anomaly_hist[device_id] = deque(maxlen=self.window_n)
+                    self._security_clean_streak[device_id] = 0
+                    self._operational_clean_streak[device_id] = 0
+                    continue
+                if self._generations.get(device_id) != generation:
+                    continue
+                if registry_phase in _SECURITY_STATUS_BY_PHASE:
+                    restored_phase = self._security_phases[device_id]
+                    if _SECURITY_PHASE_RANK[registry_phase] > _SECURITY_PHASE_RANK[restored_phase]:
+                        self._security_phases[device_id] = registry_phase
+            except (TypeError, ValueError, KeyError):
+                continue
+
+    def get_operational_status(self, device_id: str) -> str:
+        return self._operational_states.get(device_id, "HEALTHY")
+
+    def get_security_status(self, device_id: str) -> str:
+        return self._status_for_phase(self._security_phases.get(device_id, "ACTIVE"))
+
+    def get_security_phase(self, device_id: str) -> str:
+        return self._security_phases.get(device_id, "ACTIVE")
+
+    def get_state(self, device_id: str) -> str:
+        """Return the historical V5 state view without conflating stored dimensions."""
+        phase = self.get_security_phase(device_id)
+        if phase in {"ENFORCEMENT_PENDING", "SHADOW_QUARANTINE", "RECOVERY_PENDING", "ENFORCEMENT_FAILED", "REVOKED"}:
+            return phase
+        operational = self.get_operational_status(device_id)
+        if operational == "FAULT":
+            return "FAULT"
+        if operational == "DEGRADED":
+            return "DEGRADED"
+        if phase == "MONITORING":
+            return "MONITORING"
+        return "ACTIVE"
 
     def _persist(self, device_id: str, generation: int) -> None:
-        saver = getattr(self.storage, "save_policy_state", None)
+        phase = self.get_security_phase(device_id)
+        operational = self.get_operational_status(device_id)
+        security_history = list(self._security_transition_history.get(device_id, ()))
+        operational_history = list(self._operational_transition_history.get(device_id, ()))
+        saver = getattr(self.storage, "save_policy_dimensions", None)
         if callable(saver):
-            hist = list(self._anomaly_hist.get(device_id, ()))
             saver(
                 device_id=device_id,
                 generation=generation,
-                current_state=self.get_state(device_id),
-                anomaly_history=hist,
-                clean_streak=self._clean_streak.get(device_id, 0),
+                security_phase=phase,
+                security_status=self.get_security_status(device_id),
+                operational_status=operational,
+                security_anomaly_history=list(self._security_anomaly_hist.get(device_id, ())),
+                security_clean_streak=self._security_clean_streak.get(device_id, 0),
+                operational_clean_streak=self._operational_clean_streak.get(device_id, 0),
+                security_transition_history=security_history,
+                operational_transition_history=operational_history,
             )
-            self._generations[device_id] = generation
+        else:
+            # Lightweight V5 storage doubles still receive the old snapshot.
+            legacy_saver = getattr(self.storage, "save_policy_state", None)
+            if callable(legacy_saver):
+                legacy_saver(
+                    device_id=device_id, generation=generation, current_state=phase,
+                    anomaly_history=list(self._security_anomaly_hist.get(device_id, ())),
+                    clean_streak=self._security_clean_streak.get(device_id, 0),
+                )
+        self._generations[device_id] = generation
 
-    def get_state(self, device_id: str) -> str:
-        return self._states.get(device_id, "ACTIVE")
+    def _record_dimension_transition(
+        self, device_id: str, generation: int, dimension: str,
+        old_state: str, new_state: str, reason: str,
+    ) -> None:
+        if old_state == new_state:
+            return
+        history_map = (self._security_transition_history if dimension == "security"
+                       else self._operational_transition_history)
+        history = history_map.setdefault(device_id, [])
+        history.append(f"{old_state}->{new_state}:{reason[:96]}")
+        del history[:-64]
+        recorder = getattr(self.storage, "append_policy_dimension_transition", None)
+        if callable(recorder):
+            recorder(device_id, generation, dimension, old_state, new_state, reason)
+
+    def _set_operational_status(self, device_id: str, generation: int, new_status: str, reason: str) -> bool:
+        if new_status not in _OPERATIONAL_STATES:
+            raise ValueError(f"unsupported operational status: {new_status}")
+        old = self.get_operational_status(device_id)
+        if old == new_status:
+            return False
+        self._operational_states[device_id] = new_status
+        self._record_dimension_transition(device_id, generation, "operational", old, new_status, reason)
+        return True
+
+    def _set_security_phase(
+        self, device_id: str, generation: int, new_phase: str, reason: str,
+        risk_score: float = 0.0,
+    ) -> bool:
+        if new_phase not in _SECURITY_STATUS_BY_PHASE:
+            raise ValueError(f"unsupported security phase: {new_phase}")
+        old = self.get_security_phase(device_id)
+        if old == new_phase:
+            return False
+        # Preserve the existing V5 hash-chained quarantine log for enforcement
+        # transitions, and add the independent V6 security-dimension chain.
+        self.storage.append_quarantine_transition(
+            device_id, generation, old, new_phase, reason, risk_score, self.policy_version,
+        )
+        self._security_phases[device_id] = new_phase
+        self._record_dimension_transition(device_id, generation, "security", old, new_phase, reason)
+        return True
 
     def _apply_pep(self, device_id: str, enable: bool, decision_id: str) -> bool:
         if self.pep_request_fn is not None:
@@ -137,155 +320,214 @@ class RiskPolicyEngine:
             return False
         return bool(self.pep_apply_fn(device_id, enable))
 
-    def _decision(self, dec_id, dev, old, new, action, reason, confirmed, ev):
-        self._states[dev] = new
+    def _decision(
+        self, dec_id: str, dev: str, old: str, action: str, reason: str,
+        confirmed: bool, generation: int,
+    ) -> PolicyDecision:
+        self._persist(dev, generation)
+        return PolicyDecision(
+            dec_id, dev, old, self.get_state(dev), action, reason, confirmed,
+            self.get_operational_status(dev), self.get_security_status(dev),
+        )
+
+    def _update_operational_dimension(self, ev: DetectionEvidence) -> tuple[bool, str]:
+        dev = ev.device_id
+        current = self.get_operational_status(dev)
+        incoming = ev.operational_status if ev.operational_status in _OPERATIONAL_STATES else current
+        changed = False
+        reason = ""
+        if incoming == "FAULT":
+            self._operational_clean_streak[dev] = 0
+            changed = self._set_operational_status(dev, ev.generation, "FAULT", ev.fault_type or "OPERATIONAL_FAULT")
+            reason = ev.fault_type or "OPERATIONAL_FAULT"
+        elif incoming == "DEGRADED":
+            self._operational_clean_streak[dev] = 0
+            changed = self._set_operational_status(dev, ev.generation, "DEGRADED", "OPERATIONAL_DEGRADED")
+            reason = "OPERATIONAL_DEGRADED"
+        elif incoming == "HEALTHY" and current != "HEALTHY":
+            streak = self._operational_clean_streak.get(dev, 0) + 1
+            self._operational_clean_streak[dev] = streak
+            required = self.fault_recovery_clean_windows if current == "FAULT" else 2
+            if streak >= required:
+                changed = self._set_operational_status(dev, ev.generation, "HEALTHY", "OPERATIONAL_CLEAN_WINDOW_RECOVERY")
+                self._operational_clean_streak[dev] = 0
+                reason = "OPERATIONAL_CLEAN_WINDOW_RECOVERY"
+        elif incoming == "HEALTHY":
+            self._operational_clean_streak[dev] = 0
+        return changed, reason
+
+    def _evaluate_revocation(self, ev: DetectionEvidence, legacy_old: str) -> PolicyDecision:
+        dev = ev.device_id
+        phase = self.get_security_phase(dev)
+        if phase == "REVOKED":
+            return self._decision("noop", dev, legacy_old, "NONE", "ALREADY_REVOKED", True, ev.generation)
+        decision_id = f"dec-{uuid.uuid4().hex[:10]}"
+        reason = ev.deterministic_reason or "EXPLICIT_CERTIFICATE_REVOCATION"
+        self.storage.record_enforcement_decision(
+            decision_id, dev, ev.generation, phase, "REVOKED", reason, self.policy_version,
+        )
+        verified = False
+        if self.revocation_fn is not None:
+            try:
+                verified = bool(self.revocation_fn(dev, reason))
+            except Exception:
+                verified = False
+        self.storage.confirm_enforcement_pep(
+            decision_id, verified,
+            detail="revocation_ledger_verified" if verified else "revocation_not_verified",
+        )
+        target = "REVOKED" if verified else "ENFORCEMENT_FAILED"
+        self._set_security_phase(dev, ev.generation, target, reason, 1.0)
+        return self._decision(
+            decision_id, dev, legacy_old,
+            "REVOKE_DETERMINISTIC" if verified else "REVOCATION_FAILED_QUARANTINED",
+            reason, verified, ev.generation,
+        )
+
+    def _enforce_quarantine(self, ev: DetectionEvidence, legacy_old: str, reason: str) -> PolicyDecision:
+        dev = ev.device_id
+        decision_id = f"dec-{uuid.uuid4().hex[:10]}"
+        phase = self.get_security_phase(dev)
+        self.storage.record_enforcement_decision(
+            decision_id, dev, ev.generation, phase, "SHADOW_QUARANTINE", reason, self.policy_version,
+        )
+        self._set_security_phase(dev, ev.generation, "ENFORCEMENT_PENDING", reason, ev.lstm_score)
         self._persist(dev, ev.generation)
-        return PolicyDecision(dec_id, dev, old, new, action, reason, confirmed)
+        pep_ok = self._apply_pep(dev, True, decision_id)
+        self.storage.confirm_enforcement_pep(
+            decision_id, pep_ok,
+            detail=ev.xai_summary[:120] if pep_ok else "pep_ack_missing_or_invalid",
+        )
+        final_phase = "SHADOW_QUARANTINE" if pep_ok else "ENFORCEMENT_FAILED"
+        self._set_security_phase(
+            dev, ev.generation, final_phase,
+            "PEP_ACK_CONFIRMED" if pep_ok else "PEP_ACK_FAILED_OR_TIMEOUT",
+            ev.lstm_score,
+        )
+        return self._decision(
+            decision_id, dev, legacy_old, "QUARANTINE_SHADOW", reason, pep_ok, ev.generation,
+        )
 
     def evaluate_evidence(self, ev: DetectionEvidence) -> PolicyDecision:
         dev = ev.device_id
-        curr = self.get_state(dev)
-        # A state from a different active certificate generation is not
-        # silently inherited by the new identity generation.
+        if ev.generation < 1:
+            raise ValueError("evidence generation must be positive")
+        legacy_old = self.get_state(dev)
         known_generation = self._generations.get(dev)
         if known_generation is not None and known_generation != ev.generation:
-            curr = "ACTIVE"
-            self._states[dev] = curr
-            self._anomaly_hist[dev] = deque(maxlen=self.window_n)
-            self._clean_streak[dev] = 0
-        hist = self._anomaly_hist.setdefault(dev, deque(maxlen=self.window_n))
+            # Preserve V5 generation-scoped hysteresis reset semantics.
+            self._security_phases[dev] = "ACTIVE"
+            self._operational_states[dev] = "HEALTHY"
+            self._security_anomaly_hist[dev] = deque(maxlen=self.window_n)
+            self._security_clean_streak[dev] = 0
+            self._operational_clean_streak[dev] = 0
+            self._security_transition_history[dev] = []
+            self._operational_transition_history[dev] = []
+            legacy_old = "ACTIVE"
 
-        # Revocation only happens on an explicit cryptographic request and only
-        # after the helper returns AND the ledger-verification callback succeeds.
+        op_changed, op_reason = self._update_operational_dimension(ev)
+        operational_now = self.get_operational_status(dev)
+
         if ev.revocation_requested:
-            if curr == "REVOKED":
-                return self._decision("noop", dev, curr, curr, "NONE", "ALREADY_REVOKED", True, ev)
-            dec_id = f"dec-{uuid.uuid4().hex[:10]}"
-            reason = ev.deterministic_reason or "EXPLICIT_CERTIFICATE_REVOCATION"
-            self.storage.record_enforcement_decision(
-                dec_id, dev, ev.generation, curr, "REVOKED", reason, self.policy_version,
-            )
-            verified = False
-            if self.revocation_fn is not None:
-                try:
-                    verified = bool(self.revocation_fn(dev, reason))
-                except Exception:
-                    verified = False
-            self.storage.confirm_enforcement_pep(dec_id, verified, detail="revocation_ledger_verified" if verified else "revocation_not_verified")
-            target = "REVOKED" if verified else "ENFORCEMENT_FAILED"
-            self.storage.append_quarantine_transition(
-                dev, ev.generation, curr, target, reason, 1.0, self.policy_version,
-            )
-            return self._decision(dec_id, dev, curr, target, "REVOKE_DETERMINISTIC", reason, verified, ev)
+            decision = self._evaluate_revocation(ev, legacy_old)
+            return decision
 
-        if curr == "REVOKED":
-            return self._decision("noop", dev, curr, curr, "NONE", "REVOKED_TERMINAL", True, ev)
+        phase = self.get_security_phase(dev)
+        if phase == "REVOKED":
+            return self._decision("noop", dev, legacy_old, "NONE", "REVOKED_TERMINAL", True, ev.generation)
 
-        # Technical FAULT has its own clean-window recovery. It is not a cyber
-        # quarantine, and a healthy stream must be observed before ACTIVE.
-        if ev.operational_status == "FAULT":
-            hist.clear()
-            self._clean_streak[dev] = 0
-            if curr != "FAULT":
-                self.storage.append_quarantine_transition(
-                    dev, ev.generation, curr, "FAULT", ev.fault_type, 0.0, self.policy_version
-                )
-            return self._decision("fault", dev, curr, "FAULT", "ALERT_FAULT", ev.fault_type, True, ev)
-
-        # Safety-critical devices require corroboration except a deterministic
-        # protocol/ingress violation, which counts as a strong behavioral signal.
-        crit = self.criticality.get(dev, "normal")
-        if ev.deterministic_violation:
+        # A technical fault is not a security signal. Crucially, it does not
+        # clear anomaly history or short-circuit replay/protocol evidence.
+        criticality = self.criticality.get(dev, "normal")
+        if ev.protocol_violation:
             strong_signal = True
-        elif crit == "safety_critical":
+        elif ev.deterministic_violation:
+            strong_signal = True
+        elif operational_now == "FAULT":
+            # Model/statistical evidence from a known-bad physical stream is
+            # not promoted on its own. Explicit protocol/freshness violations
+            # above remain decisive, and any existing security quarantine is
+            # retained unchanged while the device is faulted.
+            strong_signal = False
+        elif criticality == "safety_critical":
             strong_signal = (ev.lstm_anomalous and ev.cusum_triggered) or (
                 ev.lstm_score > ev.lstm_threshold * 1.6
             )
         else:
             strong_signal = ev.lstm_anomalous or ev.cusum_triggered
 
-        hist.append(1 if strong_signal else 0)
-        self._clean_streak[dev] = 0 if strong_signal else self._clean_streak.get(dev, 0) + 1
+        hist = self._security_anomaly_hist.setdefault(dev, deque(maxlen=self.window_n))
+        if strong_signal:
+            hist.append(1)
+            self._security_clean_streak[dev] = 0
+        elif operational_now == "HEALTHY":
+            # Only healthy operational windows count as clean security evidence.
+            hist.append(0)
+            self._security_clean_streak[dev] = self._security_clean_streak.get(dev, 0) + 1
+        # DEGRADED/FAULT with no anomaly does not erase nor dilute security evidence.
         hits = sum(hist)
+        security_clean = self._security_clean_streak.get(dev, 0)
 
-        if curr == "FAULT":
-            if self._clean_streak[dev] >= self.fault_recovery_clean_windows:
-                self.storage.append_quarantine_transition(
-                    dev, ev.generation, "FAULT", "ACTIVE", "FAULT_CLEAN_WINDOW_RECOVERY",
-                    0.0, self.policy_version,
-                )
-                hist.clear()
-                self._clean_streak[dev] = 0
-                return self._decision("fault-recovery", dev, "FAULT", "ACTIVE", "RECOVER_FAULT", "FAULT_CLEAN_WINDOW_RECOVERY", True, ev)
-            if strong_signal:
-                self.storage.append_quarantine_transition(
-                    dev, ev.generation, "FAULT", "MONITORING", "BEHAVIORAL_ANOMALY_DURING_FAULT",
-                    ev.lstm_score, self.policy_version,
-                )
-                return self._decision("fault-monitor", dev, "FAULT", "MONITORING", "MONITOR", "BEHAVIORAL_ANOMALY_DURING_FAULT", True, ev)
-            self._persist(dev, ev.generation)
-            return PolicyDecision("noop", dev, "FAULT", "FAULT", "NONE", "FAULT_RECOVERY_OBSERVING_CLEAN_WINDOWS", True)
+        # Protocol/freshness violations are deterministic protocol failures and
+        # bypass behavioral K-of-N. They are rejected by AdmissionGate before
+        # feature extraction, then handled here as explicit security evidence.
+        if ev.protocol_violation and phase in {
+            "ACTIVE", "MONITORING", "RECOVERY_PENDING", "ENFORCEMENT_FAILED",
+        }:
+            # A replay during recovery invalidates the clean-window proof. Reassert
+            # the PEP quarantine rather than merely resetting the streak: the
+            # Gateway may already have prepared a two-phase release and must be
+            # driven back to the confirmed quarantined phase.
+            reason = ev.deterministic_reason or "V6_PROTOCOL_OR_FRESHNESS_VIOLATION"
+            return self._enforce_quarantine(ev, legacy_old, reason)
 
-        if curr in ("ACTIVE", "FAULT") and hits >= 1:
-            self.storage.append_quarantine_transition(
-                dev, ev.generation, curr, "MONITORING", "BEHAVIORAL_ANOMALY_OBSERVED",
-                ev.lstm_score, self.policy_version,
+        if phase == "ACTIVE" and strong_signal:
+            self._set_security_phase(dev, ev.generation, "MONITORING", "BEHAVIORAL_ANOMALY_OBSERVED", ev.lstm_score)
+            if operational_now == "FAULT":
+                return self._decision("fault-monitor", dev, legacy_old, "ALERT_FAULT", ev.fault_type, True, ev.generation)
+            if operational_now == "DEGRADED":
+                return self._decision("degraded-monitor", dev, legacy_old, "MONITOR", "BEHAVIORAL_ANOMALY_DURING_DEGRADED_OPERATION", True, ev.generation)
+            return self._decision("mon", dev, legacy_old, "MONITOR", "BEHAVIORAL_ANOMALY_OBSERVED", True, ev.generation)
+
+        if phase in {"ACTIVE", "MONITORING"} and hits >= self.trigger_k:
+            reason = (
+                ev.deterministic_reason or "DETERMINISTIC_BEHAVIORAL_VIOLATION"
+                if ev.deterministic_violation else f"HYBRID_ANOMALY_{hits}_OF_{self.window_n}"
             )
-            return self._decision("mon", dev, curr, "MONITORING", "MONITOR", "BEHAVIORAL_ANOMALY_OBSERVED", True, ev)
+            return self._enforce_quarantine(ev, legacy_old, reason)
 
-        if curr in ("ACTIVE", "MONITORING") and hits >= self.trigger_k:
-            dec_id = f"dec-{uuid.uuid4().hex[:10]}"
-            reason = (ev.deterministic_reason or "DETERMINISTIC_BEHAVIORAL_VIOLATION") if ev.deterministic_violation else f"HYBRID_ANOMALY_{hits}_OF_{self.window_n}"
+        # Recovery is gated by clean security windows and by healthy operation.
+        if phase == "SHADOW_QUARANTINE" and security_clean >= self.recovery_clean_windows:
+            self._set_security_phase(dev, ev.generation, "RECOVERY_PENDING", "CLEAN_WINDOW_STREAK", 0.0)
+            return self._decision("rec", dev, legacy_old, "MONITOR", "CLEAN_WINDOW_STREAK", True, ev.generation)
+
+        if phase == "RECOVERY_PENDING" and security_clean >= self.recovery_clean_windows + 2:
+            decision_id = f"dec-{uuid.uuid4().hex[:10]}"
             self.storage.record_enforcement_decision(
-                dec_id, dev, ev.generation, curr, "SHADOW_QUARANTINE", reason, self.policy_version
+                decision_id, dev, ev.generation, phase, "ACTIVE", "RECOVERY_VERIFIED", self.policy_version,
             )
-            self.storage.append_quarantine_transition(
-                dev, ev.generation, curr, "ENFORCEMENT_PENDING", reason, ev.lstm_score, self.policy_version
-            )
-            self._states[dev] = "ENFORCEMENT_PENDING"
-            self._persist(dev, ev.generation)
-            pep_ok = self._apply_pep(dev, True, dec_id)
+            pep_ok = self._apply_pep(dev, False, decision_id)
             self.storage.confirm_enforcement_pep(
-                dec_id, pep_ok, detail=ev.xai_summary[:120] if pep_ok else "pep_ack_missing_or_invalid"
+                decision_id, pep_ok,
+                detail="quarantine_released" if pep_ok else "release_ack_missing_or_invalid",
             )
-            final_state = "SHADOW_QUARANTINE" if pep_ok else "ENFORCEMENT_FAILED"
-            self.storage.append_quarantine_transition(
-                dev, ev.generation, "ENFORCEMENT_PENDING", final_state,
-                "PEP_ACK_CONFIRMED" if pep_ok else "PEP_ACK_FAILED_OR_TIMEOUT", ev.lstm_score, self.policy_version
-            )
-            return self._decision(dec_id, dev, curr, final_state, "QUARANTINE_SHADOW", reason, pep_ok, ev)
-
-        if curr == "SHADOW_QUARANTINE" and self._clean_streak.get(dev, 0) >= self.recovery_clean_windows:
-            self.storage.append_quarantine_transition(
-                dev, ev.generation, curr, "RECOVERY_PENDING", "CLEAN_WINDOW_STREAK", 0.0, self.policy_version
-            )
-            return self._decision("rec", dev, curr, "RECOVERY_PENDING", "MONITOR", "CLEAN_WINDOW_STREAK", True, ev)
-
-        if curr == "RECOVERY_PENDING" and self._clean_streak.get(dev, 0) >= self.recovery_clean_windows + 2:
-            dec_id = f"dec-{uuid.uuid4().hex[:10]}"
-            self.storage.record_enforcement_decision(
-                dec_id, dev, ev.generation, curr, "ACTIVE", "RECOVERY_VERIFIED", self.policy_version
-            )
-            pep_ok = self._apply_pep(dev, False, dec_id)
-            self.storage.confirm_enforcement_pep(dec_id, pep_ok, detail="quarantine_released" if pep_ok else "release_ack_missing_or_invalid")
-            # A release failure is not a neutral enforcement failure: IDS must
-            # retain the security quarantine and require a fresh clean window
-            # plus a new two-phase PEP handshake before trying again.
-            final_state = "ACTIVE" if pep_ok else "SHADOW_QUARANTINE"
+            final_phase = "ACTIVE" if pep_ok else "SHADOW_QUARANTINE"
             final_reason = "RECOVERY_VERIFIED" if pep_ok else "RELEASE_ACK_FAILED_QUARANTINE_RETAINED"
-            self.storage.append_quarantine_transition(
-                dev, ev.generation, curr, final_state, final_reason, 0.0, self.policy_version
-            )
-            if pep_ok:
-                hist.clear()
-            else:
-                self._clean_streak[dev] = 0
-                hist.clear()
+            self._set_security_phase(dev, ev.generation, final_phase, final_reason, 0.0)
+            hist.clear()
+            self._security_clean_streak[dev] = 0
             return self._decision(
-                dec_id, dev, curr, final_state,
+                decision_id, dev, legacy_old,
                 "RELEASE" if pep_ok else "RELEASE_FAILED_QUARANTINED",
-                final_reason, pep_ok, ev,
+                final_reason, pep_ok, ev.generation,
             )
 
-        self._persist(dev, ev.generation)
-        return PolicyDecision("noop", dev, curr, curr, "NONE", "STABLE", True)
+        # Emit operational alerts even when security is already quarantined.
+        if operational_now == "FAULT" and (op_changed or phase != "ACTIVE"):
+            return self._decision("fault", dev, legacy_old, "ALERT_FAULT", ev.fault_type, True, ev.generation)
+        if operational_now == "DEGRADED" and op_changed:
+            return self._decision("degraded", dev, legacy_old, "ALERT_DEGRADED", op_reason, True, ev.generation)
+        if op_changed and operational_now == "HEALTHY":
+            return self._decision("op-recovery", dev, legacy_old, "RECOVER_OPERATIONAL", op_reason, True, ev.generation)
+
+        return self._decision("noop", dev, legacy_old, "NONE", "STABLE", True, ev.generation)

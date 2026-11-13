@@ -191,3 +191,39 @@ CREATE TABLE IF NOT EXISTS policy_state (
     clean_streak INTEGER NOT NULL DEFAULT 0,
     updated_at_ns INTEGER NOT NULL
 );
+
+-- V6 keeps operational health and cybersecurity enforcement orthogonal.
+-- current_state in the V5 policy_state table remains a compatibility/security
+-- phase field; it is never overwritten by a physical FAULT transition.
+CREATE TABLE IF NOT EXISTS policy_dimensions (
+    device_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    security_phase TEXT NOT NULL,
+    security_status TEXT NOT NULL CHECK(security_status IN ('ACTIVE', 'SUSPECT', 'QUARANTINED', 'REVOKED')),
+    operational_status TEXT NOT NULL CHECK(operational_status IN ('HEALTHY', 'DEGRADED', 'FAULT')),
+    security_anomaly_history_json TEXT NOT NULL DEFAULT '[]',
+    security_clean_streak INTEGER NOT NULL DEFAULT 0 CHECK(security_clean_streak >= 0),
+    operational_clean_streak INTEGER NOT NULL DEFAULT 0 CHECK(operational_clean_streak >= 0),
+    security_transition_history_json TEXT NOT NULL DEFAULT '[]',
+    operational_transition_history_json TEXT NOT NULL DEFAULT '[]',
+    updated_at_ns INTEGER NOT NULL
+);
+
+-- Separate, independently hash-chained histories for operational and security
+-- state transitions. This prevents a hardware fault from replacing or
+-- obscuring the security quarantine history.
+CREATE TABLE IF NOT EXISTS policy_dimension_transitions (
+    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ns INTEGER NOT NULL,
+    device_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    dimension TEXT NOT NULL CHECK(dimension IN ('operational', 'security')),
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    entry_hash TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_policy_dimension_transitions_device
+    ON policy_dimension_transitions(device_id, dimension, transition_id);

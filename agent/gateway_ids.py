@@ -675,21 +675,33 @@ class ZenohInlineGateway:
         # Malformed V6 frames are incident-captured by the Gate and are never
         # forwarded as model input.
         v6_frame = None
+        is_v6 = False
         try:
             frame_doc = json.loads(raw.decode("utf-8"))
-            is_v6 = isinstance(frame_doc, dict) and frame_doc.get("protocol_version") == 6
+            # Any versioned JSON frame is handled by the strict V6 parser, even
+            # when the version field itself is unsupported or mistyped. Do not
+            # let malformed protocol envelopes fall back to the V5 scalar path.
+            is_v6 = isinstance(frame_doc, dict) and "protocol_version" in frame_doc
         except (UnicodeError, json.JSONDecodeError):
-            is_v6 = False
+            # The only supported scalar wire payload is not JSON. A malformed
+            # JSON object is therefore treated as a malformed protocol frame
+            # and incident-captured by the V6 parser rather than downgraded to
+            # the legacy V5 scalar path.
+            is_v6 = raw.lstrip().startswith(b"{")
         if is_v6:
             parsed_frame = parse_sensor_frame(target, raw, expected_device_id=device_id)
             if not parsed_frame.valid or parsed_frame.frame is None:
                 admission = self.admission_gate.evaluate_v6_and_ingest(ctx, target, raw)
                 self._inc("sensor_invalid_dropped")
                 logger.warning("[V6 FRAME REJECTED] device=%s reason=%s", sanitize(device_id, 64), admission.reason)
-                return
-            v6_frame = parsed_frame.frame
-            admission = self.admission_gate.evaluate_v6_and_ingest(ctx, target, raw)
-            envelope_payload = v6_frame.canonical_text.encode("utf-8")
+                # Forward only a small signed rejection marker. The original
+                # untrusted bytes are already persisted in incident storage;
+                # IDS needs the structured reason, not another parser input.
+                envelope_payload = b"V6_PROTOCOL_FRAME_REJECTED"
+            else:
+                v6_frame = parsed_frame.frame
+                admission = self.admission_gate.evaluate_v6_and_ingest(ctx, target, raw)
+                envelope_payload = v6_frame.canonical_text.encode("utf-8")
         else:
             # AdmissionGate persists admitted rows or rejected evidence synchronously.
             # Any queue/SQLite failure propagates to the worker callback and fails closed.
@@ -709,16 +721,19 @@ class ZenohInlineGateway:
             admission_reason=admission.reason,
             admission_numeric_value=admission.numeric_value,
         )
-        if v6_frame is not None:
+        if is_v6:
             gateway_identity, gateway_signing_key = load_active_device_signing_key(self.cert_pointer, "gateway")
             envelope_args.update(
                 protocol_version=6,
-                boot_id=v6_frame.boot_id,
-                sequence=v6_frame.sequence,
-                device_timestamp_ns=v6_frame.device_timestamp_ns,
                 gateway_identity=gateway_identity,
                 gateway_signing_key=gateway_signing_key,
             )
+            if v6_frame is not None:
+                envelope_args.update(
+                    boot_id=v6_frame.boot_id,
+                    sequence=v6_frame.sequence,
+                    device_timestamp_ns=v6_frame.device_timestamp_ns,
+                )
         envelope = IdentityEnvelope.create(**envelope_args)
         self.session.put(f"{INTERNAL_TELEMETRY_PREFIX}{device_id}", envelope.encode())
 

@@ -145,6 +145,44 @@ class _SingleWriterWorker:
 
     def _ensure_schema_migrations(self, conn: sqlite3.Connection) -> None:
         """Apply additive migrations for existing V5 databases without data loss."""
+        if self.db_path.name == "security_control.db":
+            # ``executescript`` already creates these for fresh DBs. Keep the
+            # CREATE IF NOT EXISTS calls here as an explicit additive migration
+            # for pre-V6 control databases opened with an older schema bundle.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS policy_dimensions (
+                    device_id TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL CHECK(generation > 0),
+                    security_phase TEXT NOT NULL,
+                    security_status TEXT NOT NULL CHECK(security_status IN ('ACTIVE','SUSPECT','QUARANTINED','REVOKED')),
+                    operational_status TEXT NOT NULL CHECK(operational_status IN ('HEALTHY','DEGRADED','FAULT')),
+                    security_anomaly_history_json TEXT NOT NULL DEFAULT '[]',
+                    security_clean_streak INTEGER NOT NULL DEFAULT 0 CHECK(security_clean_streak >= 0),
+                    operational_clean_streak INTEGER NOT NULL DEFAULT 0 CHECK(operational_clean_streak >= 0),
+                    security_transition_history_json TEXT NOT NULL DEFAULT '[]',
+                    operational_transition_history_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at_ns INTEGER NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS policy_dimension_transitions (
+                    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ns INTEGER NOT NULL,
+                    device_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    dimension TEXT NOT NULL CHECK(dimension IN ('operational','security')),
+                    from_state TEXT NOT NULL,
+                    to_state TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL,
+                    entry_hash TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_policy_dimension_transitions_device "
+                "ON policy_dimension_transitions(device_id, dimension, transition_id)"
+            )
+            return
         if self.db_path.name != "telemetry_normal.db":
             return
         columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
@@ -641,6 +679,184 @@ class LumenStorageManager:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
             return restored
+        finally:
+            conn.close()
+
+    def append_policy_dimension_transition(
+        self,
+        device_id: str,
+        generation: int,
+        dimension: str,
+        from_state: str,
+        to_state: str,
+        reason_code: str,
+    ) -> str:
+        """Append a per-device, per-dimension hash-chained state transition."""
+        if dimension not in {"operational", "security"}:
+            raise ValueError("dimension must be 'operational' or 'security'")
+        if generation < 1 or not device_id:
+            raise ValueError("invalid device identity for policy transition")
+        ts_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> str:
+            previous = conn.execute(
+                """SELECT entry_hash FROM policy_dimension_transitions
+                   WHERE device_id=? AND dimension=? ORDER BY transition_id DESC LIMIT 1""",
+                (device_id, dimension),
+            ).fetchone()
+            prev_hash = str(previous[0]) if previous else GENESIS_HASH
+            canonical = json.dumps(
+                {
+                    "ts_ns": ts_ns,
+                    "device_id": device_id,
+                    "generation": generation,
+                    "dimension": dimension,
+                    "from_state": from_state,
+                    "to_state": to_state,
+                    "reason_code": reason_code,
+                    "prev_hash": prev_hash,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            entry_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            conn.execute(
+                """INSERT INTO policy_dimension_transitions
+                   (ts_ns, device_id, generation, dimension, from_state, to_state,
+                    reason_code, prev_hash, entry_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ts_ns, device_id, generation, dimension, from_state, to_state,
+                 reason_code[:256], prev_hash, entry_hash),
+            )
+            return entry_hash
+
+        return str(self._writers["control"].submit_sync(_op))
+
+    def save_policy_dimensions(
+        self,
+        *,
+        device_id: str,
+        generation: int,
+        security_phase: str,
+        security_status: str,
+        operational_status: str,
+        security_anomaly_history: list[int] | tuple[int, ...],
+        security_clean_streak: int,
+        operational_clean_streak: int,
+        security_transition_history: list[str] | tuple[str, ...],
+        operational_transition_history: list[str] | tuple[str, ...],
+    ) -> None:
+        """Persist independent V6 state dimensions and V5 compatibility snapshot."""
+        valid_security = {"ACTIVE", "SUSPECT", "QUARANTINED", "REVOKED"}
+        valid_operational = {"HEALTHY", "DEGRADED", "FAULT"}
+        if generation < 1 or security_status not in valid_security or operational_status not in valid_operational:
+            raise ValueError("invalid V6 policy dimensions")
+        if security_clean_streak < 0 or operational_clean_streak < 0:
+            raise ValueError("policy clean streaks cannot be negative")
+        if any(value not in (0, 1) for value in security_anomaly_history):
+            raise ValueError("security anomaly history must contain only 0/1 values")
+        anomaly_json = json.dumps(list(security_anomaly_history), separators=(",", ":"))
+        security_history_json = json.dumps(list(security_transition_history)[-64:], separators=(",", ":"))
+        operational_history_json = json.dumps(list(operational_transition_history)[-64:], separators=(",", ":"))
+        updated_at_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """INSERT INTO policy_dimensions
+                   (device_id, generation, security_phase, security_status, operational_status,
+                    security_anomaly_history_json, security_clean_streak, operational_clean_streak,
+                    security_transition_history_json, operational_transition_history_json, updated_at_ns)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(device_id) DO UPDATE SET
+                    generation=excluded.generation,
+                    security_phase=excluded.security_phase,
+                    security_status=excluded.security_status,
+                    operational_status=excluded.operational_status,
+                    security_anomaly_history_json=excluded.security_anomaly_history_json,
+                    security_clean_streak=excluded.security_clean_streak,
+                    operational_clean_streak=excluded.operational_clean_streak,
+                    security_transition_history_json=excluded.security_transition_history_json,
+                    operational_transition_history_json=excluded.operational_transition_history_json,
+                    updated_at_ns=excluded.updated_at_ns""",
+                (device_id, generation, security_phase, security_status, operational_status,
+                 anomaly_json, security_clean_streak, operational_clean_streak,
+                 security_history_json, operational_history_json, updated_at_ns),
+            )
+            # Keep old readers and V5 diagnostics working, but store the
+            # security phase here: operational FAULT never overwrites it.
+            conn.execute(
+                """INSERT INTO policy_state
+                   (device_id, generation, current_state, anomaly_history_json, clean_streak, updated_at_ns)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(device_id) DO UPDATE SET
+                    generation=excluded.generation,
+                    current_state=excluded.current_state,
+                    anomaly_history_json=excluded.anomaly_history_json,
+                    clean_streak=excluded.clean_streak,
+                    updated_at_ns=excluded.updated_at_ns""",
+                (device_id, generation, security_phase, anomaly_json, security_clean_streak, updated_at_ns),
+            )
+
+        self._writers["control"].submit_sync(_op)
+
+    def load_policy_dimensions(self) -> dict[str, dict[str, Any]]:
+        """Restore orthogonal operational/security policy state after restart."""
+        conn = self.connect_readonly("control")
+        try:
+            rows = conn.execute(
+                """SELECT device_id, generation, security_phase, security_status,
+                          operational_status, security_anomaly_history_json,
+                          security_clean_streak, operational_clean_streak,
+                          security_transition_history_json, operational_transition_history_json
+                   FROM policy_dimensions"""
+            ).fetchall()
+            result: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                try:
+                    anomaly = json.loads(row["security_anomaly_history_json"])
+                    sec_hist = json.loads(row["security_transition_history_json"])
+                    op_hist = json.loads(row["operational_transition_history_json"])
+                    if (not isinstance(anomaly, list) or any(v not in (0, 1) for v in anomaly)
+                            or not isinstance(sec_hist, list) or not isinstance(op_hist, list)):
+                        continue
+                    result[str(row["device_id"])] = {
+                        "generation": int(row["generation"]),
+                        "security_phase": str(row["security_phase"]),
+                        "security_status": str(row["security_status"]),
+                        "operational_status": str(row["operational_status"]),
+                        "security_anomaly_history": [int(v) for v in anomaly],
+                        "security_clean_streak": max(0, int(row["security_clean_streak"])),
+                        "operational_clean_streak": max(0, int(row["operational_clean_streak"])),
+                        "security_transition_history": [str(v) for v in sec_hist][-64:],
+                        "operational_transition_history": [str(v) for v in op_hist][-64:],
+                    }
+                except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                    continue
+            return result
+        finally:
+            conn.close()
+
+    def load_policy_dimension_transitions(
+        self, device_id: str | None = None, dimension: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the independently auditable operational/security histories."""
+        if dimension is not None and dimension not in {"operational", "security"}:
+            raise ValueError("invalid policy transition dimension")
+        clauses, params = [], []
+        if device_id is not None:
+            clauses.append("device_id=?")
+            params.append(device_id)
+        if dimension is not None:
+            clauses.append("dimension=?")
+            params.append(dimension)
+        sql = "SELECT * FROM policy_dimension_transitions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY transition_id"
+        conn = self.connect_readonly("control")
+        try:
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
         finally:
             conn.close()
 
