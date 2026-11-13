@@ -44,23 +44,63 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_symlink_or_reparse(path: Path) -> bool:
+    """Detect symlinks and Windows junction/reparse points without following them."""
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
+        info = path.lstat()
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        attributes = getattr(info, "st_file_attributes", 0)
+        return bool(attributes & reparse_flag)
+    except FileNotFoundError as exc:
+        raise ValueError(f"bundle entry disappeared during scan: {path}") from exc
+
+
 def _artifact_files(bundle_dir: Path) -> dict[str, Path]:
-    """Return safe, regular, non-symlink artifact paths relative to bundle_dir."""
-    root = Path(bundle_dir).resolve(strict=True)
+    """Return every regular artifact, rejecting links before directory traversal.
+
+    ``Path.rglob`` plus ``is_dir`` follows directory symlinks on some platforms.
+    Use an explicit no-follow scandir walk and reject Windows reparse points too.
+    """
+    requested_root = Path(bundle_dir)
+    if _is_symlink_or_reparse(requested_root):
+        raise ValueError(f"model bundle root must not be a symlink or reparse point: {requested_root}")
+    root = requested_root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"model bundle root is not a directory: {root}")
+
     artifacts: dict[str, Path] = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_dir():
-            continue
-        if path.name in (MANIFEST_NAME, SIGNATURE_NAME):
-            continue
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"bundle artifacts must be regular files, not links: {path}")
-        relative = path.relative_to(root).as_posix()
-        _safe_relative_path(relative)
-        resolved = path.resolve(strict=True)
-        if root not in resolved.parents:
-            raise ValueError(f"bundle artifact escapes bundle directory: {relative}")
-        artifacts[relative] = path
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        if _is_symlink_or_reparse(directory):
+            raise ValueError(f"bundle directory must not be a symlink or reparse point: {directory}")
+        try:
+            with os.scandir(directory) as iterator:
+                for entry in sorted(iterator, key=lambda item: item.name):
+                    path = Path(entry.path)
+                    # Must precede is_dir/is_file: both may follow links.
+                    if _is_symlink_or_reparse(path):
+                        raise ValueError(f"bundle artifacts must not be symlinks or reparse points: {path}")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+                        continue
+                    if entry.name in (MANIFEST_NAME, SIGNATURE_NAME):
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        raise ValueError(f"bundle artifacts must be regular files: {path}")
+                    relative = path.relative_to(root).as_posix()
+                    _safe_relative_path(relative)
+                    resolved = path.resolve(strict=True)
+                    if root not in resolved.parents:
+                        raise ValueError(f"bundle artifact escapes bundle directory: {relative}")
+                    artifacts[relative] = path
+        except OSError as exc:
+            raise ValueError(f"cannot safely scan model bundle directory {directory}: {exc}") from exc
     missing = REQUIRED_ARTIFACTS.difference(artifacts)
     if missing:
         raise FileNotFoundError(f"missing required model artifacts: {sorted(missing)}")

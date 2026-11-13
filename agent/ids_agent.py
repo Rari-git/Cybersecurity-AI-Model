@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from importlib import import_module
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -47,6 +48,7 @@ from utils.features_v5 import (
     FEATURE_DIM,
     FEATURE_SCHEMA_VERSION,
 )
+from utils.sensor_payload import parse_sensor_payload
 from utils.xai_explainer import NormalizedXaiExplainer
 from utils.device_registry import DeviceRegistry
 from utils.device_identity import load_active_device_identity
@@ -295,30 +297,93 @@ class ZenohIDSAgent:
         except Exception:
             logger.exception("[PEP ACK] malformed acknowledgment rejected")
 
-    def _dispatch_pep_policy(self, device_id: str, enable_quarantine: bool, decision_id: str) -> bool:
-        """Publish a PEP command and wait for its exact correlated Gateway ACK."""
-        target_state = "SHADOW_QUARANTINE" if enable_quarantine else "ACTIVE"
-        self.pep_ack_registry.register(decision_id, device_id, target_state)
-        cmd = {
+    def _publish_pep_request(self, device_id: str, decision_id: str, target_state: str, **extra) -> bool:
+        command = {
             "decision_id": decision_id,
             "device_id": device_id,
             "target_state": target_state,
             "issued_at_unix": time.time(),
             "source": "ids_policy_engine_v5",
+            **extra,
         }
         try:
             self.session.put(
                 f"control/policy/{device_id}",
-                json.dumps(cmd, separators=(",", ":")).encode("utf-8"),
+                json.dumps(command, separators=(",", ":")).encode("utf-8"),
             )
+            return True
         except Exception as exc:
-            self.pep_ack_registry.cancel(decision_id)
             logger.error("[PEP DISPATCH ERROR] device=%s target=%s err=%s",
                          sanitize(device_id, 64), target_state, sanitize(exc, 120))
             return False
+
+    def _wait_for_pep_ack(self, decision_id: str, device_id: str, requested_action: str) -> bool:
         ack = self.pep_ack_registry.wait(decision_id, self.pep_ack_timeout_sec)
-        return bool(ack is not None and ack.confirmed and ack.device_id == device_id
-                    and ack.requested_action == target_state)
+        return bool(
+            ack is not None and ack.confirmed and ack.device_id == device_id
+            and ack.requested_action == requested_action
+        )
+
+    def _best_effort_reassert_quarantine(self, device_id: str, source_decision_id: str) -> None:
+        """Compensate for an uncertain release; Gateway APPLY is idempotent."""
+        decision_id = f"{source_decision_id}-reassert-{uuid.uuid4().hex[:8]}"
+        if not self._publish_pep_request(
+            device_id, decision_id, "SHADOW_QUARANTINE", phase="APPLY",
+        ):
+            logger.critical("[PEP FAIL-CLOSED] unable to publish quarantine reassertion for %s",
+                            sanitize(device_id, 64))
+
+    def _dispatch_pep_policy(self, device_id: str, enable_quarantine: bool, decision_id: str) -> bool:
+        """Correlate quarantine ACKs and use a staged fail-closed release.
+
+        Gateway remains quarantined through PREPARE and READY acknowledgments.
+        IDS sends FINALIZE only after both exact ACKs are received; either
+        timeout triggers a compensating quarantine assertion.
+        """
+        if enable_quarantine:
+            action = "SHADOW_QUARANTINE"
+            self.pep_ack_registry.register(decision_id, device_id, action)
+            if not self._publish_pep_request(device_id, decision_id, action, phase="APPLY"):
+                self.pep_ack_registry.cancel(decision_id)
+                return False
+            return self._wait_for_pep_ack(decision_id, device_id, action)
+
+        prepare_id = f"{decision_id}-prepare"
+        commit_id = f"{decision_id}-commit"
+        self.pep_ack_registry.register(prepare_id, device_id, "RELEASE_PREPARE")
+        if not self._publish_pep_request(
+            device_id, prepare_id, "ACTIVE", phase="PREPARE_RELEASE",
+        ):
+            self.pep_ack_registry.cancel(prepare_id)
+            self._best_effort_reassert_quarantine(device_id, decision_id)
+            return False
+        if not self._wait_for_pep_ack(prepare_id, device_id, "RELEASE_PREPARE"):
+            self._best_effort_reassert_quarantine(device_id, decision_id)
+            return False
+
+        self.pep_ack_registry.register(commit_id, device_id, "RELEASE_READY")
+        if not self._publish_pep_request(
+            device_id, commit_id, "ACTIVE", phase="COMMIT_RELEASE",
+            prepare_decision_id=prepare_id,
+        ):
+            self.pep_ack_registry.cancel(commit_id)
+            self._best_effort_reassert_quarantine(device_id, decision_id)
+            return False
+        if not self._wait_for_pep_ack(commit_id, device_id, "RELEASE_READY"):
+            self._best_effort_reassert_quarantine(device_id, decision_id)
+            return False
+
+        # Both Gateway acknowledgments have reached IDS while Gateway remains
+        # quarantined. Finalize is one-way: if delivery is lost, Gate remains
+        # blocked (availability loss, not an ingress security bypass).
+        finalize_id = f"{decision_id}-finalize"
+        if not self._publish_pep_request(
+            device_id, finalize_id, "ACTIVE", phase="FINALIZE_RELEASE",
+            prepare_decision_id=prepare_id, ready_decision_id=commit_id,
+        ):
+            self._best_effort_reassert_quarantine(device_id, decision_id)
+            return False
+        return True
 
     def _revoke_device_certificate(self, device_id: str, reason: str) -> bool:
         """Revoke an active certificate and explicitly verify its serial in the ledger."""
@@ -395,10 +460,30 @@ class ZenohIDSAgent:
     def _process_sensor(
         self, key: str, payload_str: str, delta_t: float, rate: float,
         device_id: str | None = None, generation: int = 1,
+        admission_status: str = "ADMITTED", admission_reason: str = "LEGACY_UNVERIFIED",
+        admission_numeric_value: float | None = None,
     ) -> None:
         payload_str = truncate_payload(payload_str)
-        raw_bytes = payload_str.encode("utf-8", errors="replace")
+        raw_bytes = payload_str.encode("utf-8", errors="strict")
         device_id = self._resolve_device_id(key, device_id)
+        parsed = parse_sensor_payload(key, raw_bytes)
+        disagreement = (
+            admission_status == "ADMITTED"
+            and (not parsed.valid or (
+                admission_numeric_value is not None
+                and parsed.numeric_value is not None
+                and not math.isclose(float(admission_numeric_value), parsed.numeric_value, rel_tol=1e-9, abs_tol=1e-9)
+            ))
+        )
+        if admission_status != "ADMITTED" or disagreement or not parsed.valid:
+            reason = admission_reason if admission_status == "REJECTED" else (
+                "GATE_IDS_SCHEMA_DISAGREEMENT" if disagreement else parsed.reason
+            )
+            self._record_protocol_violation(device_id, generation, key, reason)
+            return
+        # Both Gateway and IDS operate on the same normalized scalar string.
+        payload_str = parsed.canonical_text
+        raw_bytes = payload_str.encode("utf-8")
 
         flood = rule_flood(delta_t, rate)
         if flood:
@@ -520,12 +605,41 @@ class ZenohIDSAgent:
                 severity="low",
             )
 
-    def _process_sample(self, key, payload_bytes, recv_time, delta_t, rate, device_id=None, generation=1) -> None:
+    def _record_protocol_violation(self, device_id: str, generation: int, topic: str, reason: str) -> None:
+        """Keep rejected ingress out of normal features and feed explicit protocol evidence."""
+        self.stats["unknown"] += 1
+        evidence = DetectionEvidence(
+            device_id=device_id, generation=generation, topic=topic,
+            lstm_score=0.0, lstm_threshold=1.0, lstm_anomalous=False,
+            cusum_score=0.0, cusum_triggered=False,
+            operational_status="HEALTHY", fault_type="NONE",
+            deterministic_violation=True,
+            deterministic_reason=f"ADMISSION_REJECTED:{reason}"[:160],
+            xai_summary="Gateway AdmissionGate rejected the raw sensor payload",
+        )
+        decision = self.policy_engine.evaluate_evidence(evidence)
+        self._publish_v5_alert(
+            device_id=device_id, topic=topic,
+            attack_label="Sensor Protocol / Admission Violation",
+            action="ADMISSION_REJECTED",
+            score=1.0,
+            detail=f"AdmissionGate/IDS shared-schema rejection: {reason}"[:180],
+            severity="high",
+        )
+        if decision.action == "QUARANTINE_SHADOW":
+            self.stats["quarantines_issued"] += 1
+
+    def _process_sample(self, key, payload_bytes, recv_time, delta_t, rate, device_id=None, generation=1,
+                        admission_status="ADMITTED", admission_reason="LEGACY_UNVERIFIED",
+                        admission_numeric_value=None) -> None:
         payload_str = payload_bytes.decode("utf-8", errors="replace")
         if key.startswith("home/actuators"):
             self._process_actuator(key, payload_str)
         else:
-            self._process_sensor(key, truncate_payload(payload_str), delta_t, rate, device_id, generation)
+            self._process_sensor(
+                key, truncate_payload(payload_str), delta_t, rate, device_id, generation,
+                admission_status, admission_reason, admission_numeric_value,
+            )
 
     def _next_item(self):
         self.wake.clear()
@@ -590,7 +704,10 @@ class ZenohIDSAgent:
                 self.stats["oversize"] += 1
                 return
             try:
-                self.sensor_queue.put_nowait((env.original_topic, payload, now, delta_t, rate, env.device_id, env.generation))
+                self.sensor_queue.put_nowait((
+                    env.original_topic, payload, now, delta_t, rate, env.device_id, env.generation,
+                    env.admission_status, env.admission_reason, env.admission_numeric_value,
+                ))
                 self.wake.set()
             except Full:
                 self.stats["queue_full"] += 1

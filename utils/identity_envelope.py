@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import math
 import re
 import time
 import uuid
@@ -30,6 +31,9 @@ class AuthenticatedTelemetryEnvelope:
     gateway_instance_id: str
     identity_source: str = "gateway_mtls_acl"
     version: int = 1
+    admission_status: str = "ADMITTED"
+    admission_reason: str = "LEGACY_UNVERIFIED"
+    admission_numeric_value: float | None = None
 
     @classmethod
     def create(
@@ -44,6 +48,9 @@ class AuthenticatedTelemetryEnvelope:
         gateway_instance_id: str,
         event_timestamp_ns: int | None = None,
         message_id: str | None = None,
+        admission_status: str = "ADMITTED",
+        admission_reason: str = "LEGACY_UNVERIFIED",
+        admission_numeric_value: float | None = None,
     ) -> "AuthenticatedTelemetryEnvelope":
         if not _DEVICE_ID.fullmatch(device_id):
             raise ValueError("invalid authenticated device_id")
@@ -72,6 +79,9 @@ class AuthenticatedTelemetryEnvelope:
             event_timestamp_ns=ts,
             message_id=message_id or uuid.uuid4().hex,
             gateway_instance_id=gateway_instance_id,
+            admission_status=admission_status,
+            admission_reason=admission_reason,
+            admission_numeric_value=admission_numeric_value,
         )
 
     def encode(self) -> bytes:
@@ -82,7 +92,20 @@ class AuthenticatedTelemetryEnvelope:
         doc = json.loads(raw.decode("utf-8"))
         if not isinstance(doc, dict) or doc.get("version") != 1 or doc.get("identity_source") != "gateway_mtls_acl":
             raise ValueError("unsupported or untrusted telemetry envelope")
+        doc.setdefault("admission_status", "ADMITTED")
+        doc.setdefault("admission_reason", "LEGACY_UNVERIFIED")
+        doc.setdefault("admission_numeric_value", None)
         env = cls(**doc)
+        if env.admission_status not in {"ADMITTED", "REJECTED"}:
+            raise ValueError("invalid admission status in identity envelope")
+        if not isinstance(env.admission_reason, str) or len(env.admission_reason) > 256:
+            raise ValueError("invalid admission reason in identity envelope")
+        if env.admission_numeric_value is not None and (
+            isinstance(env.admission_numeric_value, bool)
+            or not isinstance(env.admission_numeric_value, (int, float))
+            or not math.isfinite(float(env.admission_numeric_value))
+        ):
+            raise ValueError("invalid admission numeric value in identity envelope")
         if not _DEVICE_ID.fullmatch(env.device_id) or not _DEVICE_ID.fullmatch(env.certificate_common_name):
             raise ValueError("invalid envelope identity")
         if isinstance(env.generation, bool) or env.generation < 1:

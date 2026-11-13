@@ -19,19 +19,13 @@ from typing import Optional
 
 from storage.telemetry_db import LumenStorageManager
 from storage.persistence import persist_normal_event, persist_incident_capture
+from utils.sensor_payload import (
+    MAX_SENSOR_PAYLOAD_BYTES, TOPIC_PHYSICAL_BOUNDS, DISCRETE_TOPIC_VALUES,
+    parse_sensor_payload,
+)
 
-MAX_RAW_PAYLOAD_BYTES = 512
+MAX_RAW_PAYLOAD_BYTES = MAX_SENSOR_PAYLOAD_BYTES
 CN_PATTERN = re.compile(r"^([a-zA-Z0-9_]+)(?:-g(\d+)-[a-zA-Z0-9_]+)?$")
-
-# Limite fizice plauzibile per topic de senzori
-TOPIC_PHYSICAL_BOUNDS: dict[str, tuple[float, float]] = {
-    "home/sensors/gas/ppm": (0.0, 2000.0),
-    "home/sensors/vibration/shock": (0.0, 5.0),
-}
-DISCRETE_TOPIC_VALUES: dict[str, frozenset[str]] = {
-    "home/sensors/door/state": frozenset({"OPEN", "CLOSED"}),
-    "home/sensors/pir/motion": frozenset({"MOTION_DETECTED", "NO_MOTION", "IDLE"}),
-}
 
 
 @dataclass(frozen=True)
@@ -52,6 +46,7 @@ class AdmissionResult:
     generation: int
     reason: str
     numeric_value: Optional[float] = None
+    canonical_text: Optional[str] = None
 
 
 def parse_device_identity(device_cn: str) -> tuple[str, int]:
@@ -65,27 +60,9 @@ def parse_device_identity(device_cn: str) -> tuple[str, int]:
 
 
 def extract_numeric_value(topic: str, payload_text: str) -> tuple[bool, Optional[float], str]:
-    """Validează schema și limitele fizice ale payload-ului înainte de scrierea în DB."""
-    clean = payload_text.strip()
-    if topic in DISCRETE_TOPIC_VALUES:
-        if clean not in DISCRETE_TOPIC_VALUES[topic]:
-            return False, None, f"INVALID_DISCRETE_STATE:{clean[:32]}"
-        mapping = {"CLOSED": 0.0, "NO_MOTION": 0.0, "IDLE": 0.0, "OPEN": 1.0, "MOTION_DETECTED": 1.0}
-        return True, mapping[clean], "OK"
-
-    if topic in TOPIC_PHYSICAL_BOUNDS:
-        try:
-            val = float(clean)
-        except ValueError:
-            return False, None, "NON_NUMERIC_PAYLOAD"
-        if val != val or val in (float("inf"), float("-inf")):
-            return False, None, "NAN_OR_INF_PAYLOAD"
-        low, high = TOPIC_PHYSICAL_BOUNDS[topic]
-        if not (low <= val <= high):
-            return False, val, f"OUT_OF_PHYSICAL_BOUNDS:{val}"
-        return True, val, "OK"
-
-    return False, None, f"UNREGISTERED_SENSOR_TOPIC:{topic}"
+    """Compatibility wrapper over the single parser shared with IDS."""
+    result = parse_sensor_payload(topic, payload_text)
+    return result.valid, result.numeric_value, result.reason
 
 
 class AdmissionGate:
@@ -156,16 +133,8 @@ class AdmissionGate:
             )
             return AdmissionResult(False, device_id, generation, "INVALID_PAYLOAD_SIZE")
 
-        try:
-            payload_text = raw_bytes.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            self._route_rejected_to_incidents(
-                ctx, device_id, generation, topic, gateway_ts_ns, device_ts_ns,
-                raw_bytes, payload_sha, "INVALID_UTF8_PAYLOAD",
-            )
-            return AdmissionResult(False, device_id, generation, "INVALID_UTF8_PAYLOAD")
-
-        ok, num_val, reason = extract_numeric_value(topic, payload_text)
+        parsed = parse_sensor_payload(topic, raw_bytes, max_bytes=MAX_RAW_PAYLOAD_BYTES)
+        ok, num_val, reason = parsed.valid, parsed.numeric_value, parsed.reason
         if not ok:
             self._route_rejected_to_incidents(
                 ctx, device_id, generation, topic, gateway_ts_ns, device_ts_ns,
@@ -188,12 +157,15 @@ class AdmissionGate:
                 len(raw_bytes),
                 payload_sha,
                 num_val,
-                payload_text.strip(),
+                parsed.canonical_text,
                 ctx.source_type,
                 ctx.admission_policy_version,
             )
         )
-        return AdmissionResult(True, device_id, generation, "ADMITTED", numeric_value=num_val)
+        return AdmissionResult(
+            True, device_id, generation, "ADMITTED",
+            numeric_value=num_val, canonical_text=parsed.canonical_text,
+        )
 
     def _route_rejected_to_incidents(
         self,

@@ -268,12 +268,24 @@ class RiskPolicyEngine:
             )
             pep_ok = self._apply_pep(dev, False, dec_id)
             self.storage.confirm_enforcement_pep(dec_id, pep_ok, detail="quarantine_released" if pep_ok else "release_ack_missing_or_invalid")
-            final_state = "ACTIVE" if pep_ok else "ENFORCEMENT_FAILED"
+            # A release failure is not a neutral enforcement failure: IDS must
+            # retain the security quarantine and require a fresh clean window
+            # plus a new two-phase PEP handshake before trying again.
+            final_state = "ACTIVE" if pep_ok else "SHADOW_QUARANTINE"
+            final_reason = "RECOVERY_VERIFIED" if pep_ok else "RELEASE_ACK_FAILED_QUARANTINE_RETAINED"
             self.storage.append_quarantine_transition(
-                dev, ev.generation, curr, final_state, "RECOVERY_VERIFIED", 0.0, self.policy_version
+                dev, ev.generation, curr, final_state, final_reason, 0.0, self.policy_version
             )
-            hist.clear()
-            return self._decision(dec_id, dev, curr, final_state, "RELEASE", "RECOVERY_VERIFIED", pep_ok, ev)
+            if pep_ok:
+                hist.clear()
+            else:
+                self._clean_streak[dev] = 0
+                hist.clear()
+            return self._decision(
+                dec_id, dev, curr, final_state,
+                "RELEASE" if pep_ok else "RELEASE_FAILED_QUARANTINED",
+                final_reason, pep_ok, ev,
+            )
 
         self._persist(dev, ev.generation)
         return PolicyDecision("noop", dev, curr, curr, "NONE", "STABLE", True)

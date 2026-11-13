@@ -65,6 +65,9 @@ class _SingleWriterWorker:
         )
         self._ready = threading.Event()
         self._init_error: Optional[BaseException] = None
+        self._fatal_error: Optional[BaseException] = None
+        self._last_batch_error: Optional[BaseException] = None
+        self._state_lock = threading.Lock()
         self._closed = False
         self._thread = threading.Thread(
             target=self._run,
@@ -90,7 +93,8 @@ class _SingleWriterWorker:
                     break
 
                 batch = [item]
-                # Grupăm până la 64 de operații asincrone într-o singură tranzacție
+                # Group up to 64 operations. A synchronous item closes the batch
+                # so its caller never waits behind more asynchronous submissions.
                 if item[1] is None:
                     while len(batch) < 64:
                         try:
@@ -105,10 +109,22 @@ class _SingleWriterWorker:
                         if nxt[1] is not None:
                             break
 
-                self._execute_batch(conn, batch)
+                try:
+                    self._execute_batch(conn, batch)
+                    with self._state_lock:
+                        self._last_batch_error = None
+                except BaseException as exc:
+                    # A failed async operation aborts the entire transaction and
+                    # is delivered to every synchronous caller in that batch.
+                    # Keep the worker alive for a later independent batch.
+                    with self._state_lock:
+                        self._last_batch_error = exc
         except BaseException as exc:
-            self._init_error = exc
+            with self._state_lock:
+                self._fatal_error = exc
+            self._init_error = self._init_error or exc
             self._ready.set()
+            self._fail_queued_callers(exc)
         finally:
             if conn is not None:
                 try:
@@ -117,31 +133,60 @@ class _SingleWriterWorker:
                     pass
                 conn.close()
 
+    def _fail_queued_callers(self, error: BaseException) -> None:
+        """Wake every queued synchronous submitter if the worker dies."""
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if item is not None:
+                    _fn, done_evt, holder = item
+                    if holder is not None:
+                        holder[:] = [error]
+                    if done_evt is not None:
+                        done_evt.set()
+            finally:
+                self._queue.task_done()
+
     def _execute_batch(self, conn: sqlite3.Connection, batch: list) -> None:
-        conn.execute("BEGIN IMMEDIATE;")
+        """Commit a whole batch or fail all synchronous callers in that batch."""
+        results: list[tuple[Optional[threading.Event], list[Any], Any]] = []
+        failure: BaseException | None = None
         try:
+            conn.execute("BEGIN IMMEDIATE;")
             for fn, done_evt, holder in batch:
-                try:
-                    res = fn(conn)
-                    if holder is not None:
-                        holder.append(res)
-                except BaseException as exc:
-                    if holder is not None:
-                        holder.append(exc)
-                    else:
-                        raise
+                result = fn(conn)
+                results.append((done_evt, holder, result))
             conn.execute("COMMIT;")
-        except BaseException:
-            conn.execute("ROLLBACK;")
-            raise
+        except BaseException as exc:
+            failure = exc
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK;")
+            except sqlite3.Error:
+                pass
         finally:
-            for _, done_evt, _ in batch:
+            if failure is None:
+                for done_evt, holder, result in results:
+                    if holder is not None:
+                        holder[:] = [result]
+            else:
+                # Do not report success for a synchronous operation whose
+                # earlier/later batch peer caused the transaction to roll back.
+                for _fn, done_evt, holder in batch:
+                    if holder is not None:
+                        holder[:] = [failure]
+            for _fn, done_evt, _holder in batch:
                 if done_evt is not None:
                     done_evt.set()
                 self._queue.task_done()
+        if failure is not None:
+            raise failure
 
     def submit_async(self, fn: Callable[[sqlite3.Connection], Any]) -> bool:
-        if self._closed:
+        if self._closed or self._fatal_error is not None or not self._thread.is_alive():
             return False
         try:
             self._queue.put_nowait((fn, None, None))
@@ -152,14 +197,24 @@ class _SingleWriterWorker:
     def submit_sync(self, fn: Callable[[sqlite3.Connection], Any], timeout: float = 5.0) -> Any:
         if self._closed:
             raise RuntimeError(f"Writer closed for {self.db_path}")
+        if self._fatal_error is not None or not self._thread.is_alive():
+            cause = self._fatal_error or RuntimeError("writer thread is not running")
+            raise RuntimeError(f"Writer unavailable for {self.db_path}") from cause
         done = threading.Event()
         holder: list[Any] = []
         self._queue.put((fn, done, holder), timeout=timeout)
         if not done.wait(timeout=timeout):
+            if self._fatal_error is not None:
+                raise RuntimeError(f"Writer failed for {self.db_path}") from self._fatal_error
             raise TimeoutError(f"DB sync write timed out for {self.db_path}")
         if holder and isinstance(holder[0], BaseException):
             raise holder[0]
         return holder[0] if holder else None
+
+    @property
+    def last_batch_error(self) -> Optional[BaseException]:
+        with self._state_lock:
+            return self._last_batch_error
 
     def flush(self, timeout: float = 5.0) -> None:
         self.submit_sync(lambda _c: None, timeout=timeout)

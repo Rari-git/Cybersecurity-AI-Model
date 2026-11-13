@@ -381,6 +381,7 @@ def test_e2_gateway_applies_policy_before_publishing_correlated_ack(monkeypatch)
     gateway._shadow_lock = threading.RLock()
     gateway._stats_lock = threading.RLock()
     gateway._shadow_quarantined = set()
+    gateway._release_prepared = {}
     gateway.stats = {}
     gateway.admission_gate = FakeAdmissionGate()
     gateway.run_id = "gateway-test-1"

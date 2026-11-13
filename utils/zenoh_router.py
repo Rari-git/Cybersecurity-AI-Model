@@ -20,6 +20,56 @@ def _replace_one(text: str, pattern: str, replacement: str, label: str) -> str:
 
 
 
+
+
+def _key_exprs_overlap(left: str, right: str) -> bool:
+    """Return whether two segment-based Zenoh expressions can match one key.
+
+    Supports literal segments, ``*`` (one segment), and ``**`` (zero or more
+    segments). The matcher is deliberately conservative for malformed
+    wildcard syntax: malformed expressions are rejected by the caller.
+    """
+    from functools import lru_cache
+
+    def parse(expr: str) -> tuple[str, ...]:
+        if not isinstance(expr, str) or not expr or expr.startswith("/") or expr.endswith("/"):
+            raise CertStoreError(f"invalid Zenoh key expression: {expr!r}")
+        parts = tuple(expr.split("/"))
+        for part in parts:
+            if not part or ("*" in part and part not in {"*", "**"}):
+                raise CertStoreError(f"unsupported wildcard syntax in Zenoh key expression: {expr!r}")
+        return parts
+
+    a, b = parse(left), parse(right)
+
+    @lru_cache(maxsize=None)
+    def visit(i: int, j: int) -> bool:
+        if i == len(a) and j == len(b):
+            return True
+        if i < len(a) and a[i] == "**":
+            # ** may match zero segments or consume a segment matched by b.
+            if visit(i + 1, j):
+                return True
+            if j < len(b):
+                if b[j] == "**":
+                    return visit(i, j + 1)
+                return visit(i, j + 1)
+            return False
+        if j < len(b) and b[j] == "**":
+            if visit(i, j + 1):
+                return True
+            if i < len(a):
+                return visit(i + 1, j)
+            return False
+        if i >= len(a) or j >= len(b):
+            return False
+        if a[i] == "*" or b[j] == "*" or a[i] == b[j]:
+            return visit(i + 1, j + 1)
+        return False
+
+    return visit(0, 0)
+
+
 def validate_router_acl_template(template_path) -> dict:
     """Fail closed unless the JSON5 router template enforces the E1/E2 trust boundary.
 
@@ -45,7 +95,14 @@ def validate_router_acl_template(template_path) -> dict:
     policies = access.get("policies")
     if not isinstance(rules, list) or not isinstance(policies, list):
         raise CertStoreError("Zenoh router ACL rules and policies must be arrays")
-    rule_map = {rule.get("id"): rule for rule in rules if isinstance(rule, dict)}
+    rule_map: dict[str, dict] = {}
+    for rule in rules:
+        if not isinstance(rule, dict) or not isinstance(rule.get("id"), str):
+            raise CertStoreError("every Zenoh ACL rule must be an object with a string id")
+        rule_id = rule["id"]
+        if rule_id in rule_map:
+            raise CertStoreError(f"duplicate Zenoh ACL rule id: {rule_id}")
+        rule_map[rule_id] = rule
     required = {
         "in_put_internal_ids_telemetry": ("internal/ids/telemetry/**", "put", "ingress"),
         "out_put_internal_ids_telemetry": ("internal/ids/telemetry/**", "put", "egress"),
@@ -103,6 +160,58 @@ def validate_router_acl_template(template_path) -> dict:
             raise CertStoreError(
                 f"Zenoh ACL rule {rule_id} must be assigned only to {sorted(expected)} "
                 f"(found {sorted(grants[rule_id])})"
+            )
+
+    # Closed-world validation: inspect every allow rule, not just the required
+    # rule IDs. A new expression such as internal/** or */pep_ack/** must not
+    # grant another role access through an overlap with a protected namespace.
+    protected_exprs = ("internal/**", "control/pep_ack/**")
+    for rule_id, rule in rule_map.items():
+        if rule.get("permission") != "allow":
+            continue
+        expressions = rule.get("key_exprs", [])
+        messages = rule.get("messages", [])
+        flows = rule.get("flows", [])
+        if not isinstance(expressions, list) or not isinstance(messages, list) or not isinstance(flows, list):
+            raise CertStoreError(f"malformed ACL expression/messages/flows in rule {rule_id}")
+        overlaps = any(
+            _key_exprs_overlap(expression, protected)
+            for expression in expressions
+            for protected in protected_exprs
+        )
+        if not overlaps:
+            continue
+
+        allowed_roles: set[str] | None = None
+        for message in messages:
+            for flow in flows:
+                if message == "put" and flow == "ingress":
+                    allowed = {"gateway"}
+                elif message == "put" and flow == "egress":
+                    allowed = {"ids"}
+                elif message == "declare_subscriber" and flow == "ingress":
+                    allowed = {"ids"}
+                else:
+                    raise CertStoreError(
+                        f"unsupported allow operation overlaps protected Zenoh namespace in rule {rule_id}: "
+                        f"{message}/{flow}"
+                    )
+                allowed_roles = allowed if allowed_roles is None else (allowed_roles & allowed)
+        if allowed_roles is None:
+            raise CertStoreError(f"protected overlapping ACL rule {rule_id} has no explicit operation")
+        granted: set[str] = set()
+        for policy in policies:
+            if not isinstance(policy, dict):
+                raise CertStoreError("ACL policies must be objects")
+            if rule_id in policy.get("rules", []):
+                subjects = policy.get("subjects", [])
+                if not isinstance(subjects, list):
+                    raise CertStoreError(f"ACL policy subjects must be an array for {rule_id}")
+                granted.update(str(subject) for subject in subjects)
+        if granted and not granted.issubset(allowed_roles):
+            raise CertStoreError(
+                f"ACL rule {rule_id} overlaps a protected namespace and grants unauthorized subjects "
+                f"{sorted(granted - allowed_roles)} (allowed: {sorted(allowed_roles)})"
             )
 
     # The policy-command route has legacy V5 operator/monitoring principals in

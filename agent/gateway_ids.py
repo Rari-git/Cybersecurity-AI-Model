@@ -85,6 +85,9 @@ class ZenohInlineGateway:
         self._rate_alert_next: dict[str, float] = {}
         self.last_seen_nonces: dict[str, int] = {}
         self._shadow_quarantined: set[str] = set()
+        # Release is a fail-closed handshake: PREPARE and READY are ACKed
+        # while ingress remains blocked; only IDS FINALIZE can open the Gate.
+        self._release_prepared: dict[str, tuple[str, float, str]] = {}
 
         self.registry = DeviceRegistry.load(
             os.environ.get("LUMEN_DEVICE_REGISTRY", "config/devices.json")
@@ -208,53 +211,148 @@ class ZenohInlineGateway:
             return device_id in self._shadow_quarantined
 
     def _on_policy_command(self, sample) -> None:
-        """Apply PEP commands and publish a correlated ACK only after the state change."""
+        """Apply idempotent PEP commands with a fail-closed staged release.
+
+        PREPARE and READY are acknowledged while the device remains blocked.
+        Gateway opens AdmissionGate only after IDS has received both correlated
+        ACKs and sends FINALIZE_RELEASE with the matching transaction IDs.
+        """
         key = str(sample.key_expr)
         parts = key.split("/")
         if len(parts) != 3 or parts[0] != "control" or parts[1] != "policy":
             return
         device_id = parts[2]
+        phase = ""
         decision_id = ""
+        target_state = ""
         try:
             raw = sample.payload.to_bytes() if hasattr(sample.payload, "to_bytes") else bytes(sample.payload)
             cmd = json.loads(raw.decode("utf-8"))
             target_state = str(cmd.get("target_state", "")).upper()
             decision_id = str(cmd.get("decision_id", ""))
+            phase = str(cmd.get("phase", "APPLY")).upper()
             if cmd.get("device_id") != device_id or not decision_id:
                 raise ValueError("PEP command device/decision correlation is missing or mismatched")
-            if target_state not in {"SHADOW_QUARANTINE", "ACTIVE"}:
-                raise ValueError("unsupported PEP target state")
-            enable = target_state == "SHADOW_QUARANTINE"
-            ok = self.set_shadow_quarantine(device_id, enable)
+
+            if phase == "PREPARE_RELEASE":
+                if target_state != "ACTIVE":
+                    raise ValueError("PREPARE_RELEASE must request ACTIVE")
+                # A prepare ACK is proof only that Gateway is still quarantined
+                # and ready. It never opens the ingress gate.
+                if not self.set_shadow_quarantine(device_id, True):
+                    raise RuntimeError("could not confirm quarantined state before release prepare")
+                ttl = max(1.0, float(os.environ.get("LUMEN_PEP_RELEASE_PREPARE_TTL_SEC", "10")))
+                with self._shadow_lock:
+                    self._release_prepared[device_id] = (decision_id, time.monotonic() + ttl)
+                ack = PepAcknowledgement(
+                    decision_id=decision_id, device_id=device_id,
+                    requested_action="RELEASE_PREPARE", applied_action="RELEASE_PREPARE",
+                    result="CONFIRMED", timestamp_ns=time.time_ns(), gateway_instance_id=self.run_id,
+                )
+                self._publish_pep_ack(ack)
+                return
+
+            if phase == "COMMIT_RELEASE":
+                if target_state != "ACTIVE":
+                    raise ValueError("COMMIT_RELEASE must request ACTIVE")
+                prepared_id = str(cmd.get("prepare_decision_id", ""))
+                with self._shadow_lock:
+                    prepared = self._release_prepared.get(device_id)
+                    valid_prepare = bool(
+                        prepared and prepared[0] == prepared_id
+                        and prepared[1] >= time.monotonic()
+                    )
+                if not valid_prepare:
+                    raise ValueError("release commit has no matching, unexpired prepare")
+                # This is the second release acknowledgment, but it is still
+                # fail-closed: Gateway confirms readiness while Gate remains blocked.
+                with self._shadow_lock:
+                    self._release_prepared[device_id] = (prepared_id, prepared[1], decision_id)
+                ack = PepAcknowledgement(
+                    decision_id=decision_id, device_id=device_id,
+                    requested_action="RELEASE_READY", applied_action="RELEASE_READY",
+                    result="CONFIRMED", timestamp_ns=time.time_ns(), gateway_instance_id=self.run_id,
+                )
+                self._publish_pep_ack(ack)
+                return
+
+            if phase == "FINALIZE_RELEASE":
+                if target_state != "ACTIVE":
+                    raise ValueError("FINALIZE_RELEASE must request ACTIVE")
+                prepared_id = str(cmd.get("prepare_decision_id", ""))
+                ready_id = str(cmd.get("ready_decision_id", ""))
+                with self._shadow_lock:
+                    prepared = self._release_prepared.get(device_id)
+                    valid_finalize = bool(
+                        prepared and prepared[0] == prepared_id
+                        and prepared[2] == ready_id
+                        and prepared[1] >= time.monotonic()
+                    )
+                if not valid_finalize:
+                    raise ValueError("release finalize has no matching, unexpired ready transaction")
+                # IDS has already received the READY ACK before it can send this
+                # command. Only now may Gateway open the admission gate. There is
+                # deliberately no post-open ACK on which security depends.
+                if not self.set_shadow_quarantine(device_id, False):
+                    raise RuntimeError("Gateway could not apply the finalized release")
+                with self._shadow_lock:
+                    self._release_prepared.pop(device_id, None)
+                return
+
+            if phase == "CANCEL_RELEASE":
+                with self._shadow_lock:
+                    self._release_prepared.pop(device_id, None)
+                ok = self.set_shadow_quarantine(device_id, True)
+                action = "SHADOW_QUARANTINE"
+            elif phase == "APPLY" and target_state == "SHADOW_QUARANTINE":
+                # An explicit quarantine assertion supersedes any outstanding
+                # release prepare token; a stale COMMIT must never reopen ingress.
+                with self._shadow_lock:
+                    self._release_prepared.pop(device_id, None)
+                ok = self.set_shadow_quarantine(device_id, True)
+                action = "SHADOW_QUARANTINE"
+            else:
+                # Bare ACTIVE commands are legacy one-phase releases and are
+                # intentionally rejected; they could reopen ingress on a lost ACK.
+                if target_state == "ACTIVE":
+                    self.set_shadow_quarantine(device_id, True)
+                raise ValueError(f"unsupported or unsafe PEP phase/target: {phase}/{target_state}")
+
             ack = PepAcknowledgement(
-                decision_id=decision_id,
-                device_id=device_id,
-                requested_action=target_state,
-                applied_action=target_state if ok else ("SHADOW_QUARANTINE" if self.is_shadow_quarantined(device_id) else "ACTIVE"),
+                decision_id=decision_id, device_id=device_id,
+                requested_action=action,
+                applied_action=action if ok else (
+                    "SHADOW_QUARANTINE" if self.is_shadow_quarantined(device_id) else "ACTIVE"
+                ),
                 result="CONFIRMED" if ok else "FAILED",
-                timestamp_ns=time.time_ns(),
-                gateway_instance_id=self.run_id,
+                timestamp_ns=time.time_ns(), gateway_instance_id=self.run_id,
             )
-            self.session.put(
-                f"{PEP_ACK_PREFIX}{decision_id}",
-                json.dumps({
-                    "decision_id": ack.decision_id, "device_id": ack.device_id,
-                    "requested_action": ack.requested_action, "applied_action": ack.applied_action,
-                    "result": ack.result, "timestamp_ns": ack.timestamp_ns,
-                    "gateway_instance_id": ack.gateway_instance_id,
-                }, separators=(",", ":")).encode("utf-8"),
-            )
+            self._publish_pep_ack(ack)
         except Exception:
-            # A lost ACK must never leave the device released while IDS believes
-            # the release is unconfirmed. Roll back release requests fail-closed.
-            if decision_id and locals().get("target_state") == "ACTIVE":
+            # A failure anywhere in a release transaction restores the local
+            # ingress block before the callback returns. IDS also compensates on
+            # a missing ACK, so a dropped ACK converges back to quarantine.
+            if target_state == "ACTIVE" or phase in {"PREPARE_RELEASE", "COMMIT_RELEASE", "CANCEL_RELEASE"}:
                 try:
+                    with self._shadow_lock:
+                        self._release_prepared.pop(device_id, None)
                     self.set_shadow_quarantine(device_id, True)
                 except Exception:
                     logger.critical("[PEP ROLLBACK] failed to restore quarantine for %s",
                                     sanitize(device_id, 64), exc_info=True)
             self._inc("callback_errors")
             logger.exception("[PEP POLICY CMD] Failed to apply/ack policy command for %s", sanitize(device_id, 64))
+
+    def _publish_pep_ack(self, ack: PepAcknowledgement) -> None:
+        self.session.put(
+            f"{PEP_ACK_PREFIX}{ack.decision_id}",
+            json.dumps({
+                "decision_id": ack.decision_id, "device_id": ack.device_id,
+                "requested_action": ack.requested_action, "applied_action": ack.applied_action,
+                "result": ack.result, "timestamp_ns": ack.timestamp_ns,
+                "gateway_instance_id": ack.gateway_instance_id,
+            }, separators=(",", ":")).encode("utf-8"),
+        )
 
     def _route_to_shadow_sandbox(self, device_id: str, target_topic: str, raw: bytes) -> None:
         """Persist and optionally publish quarantined telemetry using real PKI metadata."""
@@ -585,12 +683,16 @@ class ZenohInlineGateway:
             certificate_common_name=identity.common_name,
             certificate_fingerprint=identity.certificate_fingerprint,
             original_topic=target, payload=raw, gateway_instance_id=self.run_id,
+            admission_status="ADMITTED" if admission.admitted else "REJECTED",
+            admission_reason=admission.reason,
+            admission_numeric_value=admission.numeric_value,
         )
         self.session.put(f"{INTERNAL_TELEMETRY_PREFIX}{device_id}", envelope.encode())
 
-        # Keep legacy canonical topics only for admitted sensor values.
+        # Public topics receive only the canonical form accepted by AdmissionGate.
         if admission.admitted:
-            self.session.put(target, raw)
+            canonical_raw = str(admission.canonical_text).encode("utf-8")
+            self.session.put(target, canonical_raw)
             self._inc("sensor_forwarded")
             with self._stats_lock:
                 self.device_publish_accepted[device_id] = self.device_publish_accepted.get(device_id, 0) + 1

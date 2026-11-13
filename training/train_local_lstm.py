@@ -58,7 +58,10 @@ class TemporalLSTMAutoencoder(nn.Module):
 def _extract_windows_by_session(
     db_dir: str | Path,
     seq_len: int = 16,
-) -> tuple[dict[str, list[tuple[str, str, np.ndarray]]], dict[tuple[str, str], list[float]]]:
+) -> tuple[
+    dict[str, list[tuple[str, str, np.ndarray]]],
+    dict[str, dict[tuple[str, str], list[float]]],
+]:
     """Citește raw_events din telemetry_normal.db (?mode=ro) și construiește ferestrele
     grupat pe session_id pentru split fără data leakage.
     """
@@ -78,7 +81,9 @@ def _extract_windows_by_session(
             )
 
         windows_by_session: dict[str, list[tuple[str, str, np.ndarray]]] = {s: [] for s in sessions}
-        raw_values_by_stream: dict[tuple[str, str], list[float]] = {}
+        raw_values_by_session: dict[str, dict[tuple[str, str], list[float]]] = {
+            session_id: {} for session_id in sessions
+        }
 
         for sid in sessions:
             rows = ro.execute(
@@ -102,9 +107,12 @@ def _extract_windows_by_session(
 
                 if key in last_ts:
                     dt = (ts_ns - last_ts[key]) / 1_000_000_000.0
-                    # Dacă datele au fost capturate în timp comprimat, folosim nominal 1.0s
-                    if dt < 0.05:
-                        dt = 1.0
+                    # Preserve compressed but positive cadence: replacing short
+                    # intervals with 1s would erase replay/burst timing features.
+                    if dt <= 0:
+                        raise ValueError(
+                            f"non-monotonic gateway timestamps for {dev}::{topic} in session {sid}"
+                        )
                 else:
                     dt = 1.0
                 last_ts[key] = ts_ns
@@ -118,14 +126,36 @@ def _extract_windows_by_session(
                     operation="put",
                     numeric_value=num_val,
                 )
-                raw_values_by_stream.setdefault(key, []).append(st.raw_value)
+                raw_values_by_session[sid].setdefault(key, []).append(st.raw_value)
                 win = extractor.get_window(dev, topic)
                 if win is not None:
                     windows_by_session[sid].append((dev, topic, win))
 
-        return windows_by_session, raw_values_by_stream
+        return windows_by_session, raw_values_by_session
     finally:
         ro.close()
+
+
+def compute_cusum_baselines(
+    raw_values_by_session: dict[str, dict[tuple[str, str], list[float]]],
+    training_session_ids: list[str] | tuple[str, ...],
+) -> dict[str, dict[str, float]]:
+    """Compute CUSUM statistics from training/calibration sessions only."""
+    aggregated: dict[tuple[str, str], list[float]] = {}
+    for session_id in training_session_ids:
+        session_values = raw_values_by_session.get(session_id, {})
+        for stream, values in session_values.items():
+            aggregated.setdefault(stream, []).extend(float(v) for v in values)
+    baselines: dict[str, dict[str, float]] = {}
+    for (device_id, topic), values in aggregated.items():
+        array = np.asarray(values, dtype=np.float64)
+        if array.size == 0 or not np.isfinite(array).all():
+            raise ValueError(f"invalid training values for CUSUM stream {device_id}::{topic}")
+        baselines[f"{device_id}::{topic}"] = {
+            "mean": round(float(np.mean(array)), 6),
+            "std": round(max(float(np.std(array)), 0.05), 6),
+        }
+    return baselines
 
 
 def train_and_export_bundle(
@@ -145,7 +175,7 @@ def train_and_export_bundle(
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    windows_by_session, raw_values_by_stream = _extract_windows_by_session(db_dir, seq_len=seq_len)
+    windows_by_session, raw_values_by_session = _extract_windows_by_session(db_dir, seq_len=seq_len)
     session_ids = list(windows_by_session.keys())
     train_sessions = session_ids[:-1]
     val_sessions = [session_ids[-1]]
@@ -224,13 +254,10 @@ def train_and_export_bundle(
         else:
             stream_thresholds[skey] = round(global_threshold, 6)
 
-    cusum_baselines: dict[str, dict[str, float]] = {}
-    for (dev, topic), vals in raw_values_by_stream.items():
-        arr = np.asarray(vals, dtype=np.float64)
-        cusum_baselines[f"{dev}::{topic}"] = {
-            "mean": round(float(np.mean(arr)), 6),
-            "std": round(max(float(np.std(arr)), 0.05), 6),
-        }
+    # CUSUM calibration is deliberately derived from the training split only.
+    # The held-out validation session contributes only reconstruction-threshold
+    # calibration below; it cannot change the CUSUM baseline statistics.
+    cusum_baselines = compute_cusum_baselines(raw_values_by_session, train_sessions)
 
     bdir = Path(bundle_dir).resolve()
     bdir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +320,7 @@ def train_and_export_bundle(
             "trained_at_unix": int(time.time()),
             "train_sessions": train_sessions,
             "val_sessions": val_sessions,
+            "cusum_calibration_sessions": train_sessions,
             "train_windows": len(X_train),
             "val_windows": len(X_val_clean),
             "final_train_loss": round(final_train_loss, 6),
