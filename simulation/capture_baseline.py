@@ -11,6 +11,7 @@ import math
 import random
 import sys
 import time
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,16 +79,18 @@ def run_baseline_capture(
     gate = AdmissionGate(storage=storage, allowed_topics_by_device=DEFAULT_ALLOWED_TOPICS)
 
     rng = random.Random(seed)
+    capture_run_id = uuid.uuid4().hex
     admitted_total = 0
     rejected_total = 0
 
     try:
         for s_idx in range(1, sessions + 1):
-            session_id = f"baseline-lab-s{s_idx:02d}-seed{seed}"
+            session_id = f"baseline-lab-{capture_run_id}-s{s_idx:02d}-seed{seed}"
             storage.register_baseline_session(
                 session_id=session_id,
                 source_type="baseline_lab",
                 config={
+                    "capture_run_id": capture_run_id,
                     "session_index": s_idx,
                     "events_per_sensor": events_per_sensor,
                     "rate_hz": rate_hz,

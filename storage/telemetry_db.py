@@ -91,6 +91,12 @@ class _SingleWriterWorker:
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = sqlite3.connect(str(self.db_path), timeout=10.0, isolation_level=None)
+            conn.execute("PRAGMA foreign_keys = ON")
+            foreign_keys_enabled = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            if foreign_keys_enabled != 1:
+                raise RuntimeError(
+                    f"SQLite foreign-key enforcement is disabled for {self.db_path}"
+                )
             conn.execute("PRAGMA busy_timeout = 10000")
             conn.executescript(self._schema_sql)
             self._ensure_schema_migrations(conn)
@@ -429,14 +435,49 @@ class LumenStorageManager:
         cfg_json = json.dumps(config, sort_keys=True)
 
         def _op(conn: sqlite3.Connection) -> None:
+            # Registration is idempotent for an identical session definition.
+            # DO NOTHING preserves the original row and all child telemetry;
+            # unlike INSERT OR REPLACE, it never deletes/recreates the parent.
             conn.execute(
                 """
-                INSERT OR REPLACE INTO baseline_sessions
+                INSERT INTO baseline_sessions
                 (session_id, started_at_ns, source_type, git_hash, config_json, approved_for_training)
                 VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO NOTHING
                 """,
                 (session_id, now_ns, source_type, git_hash, cfg_json, 1 if approved_for_training else 0),
             )
+
+            existing = conn.execute(
+                """
+                SELECT source_type, git_hash, config_json, approved_for_training
+                FROM baseline_sessions
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError(
+                    f"baseline session {session_id!r} was not present after registration"
+                )
+
+            expected = (
+                source_type,
+                git_hash,
+                cfg_json,
+                1 if approved_for_training else 0,
+            )
+            actual = (
+                existing[0],
+                existing[1],
+                existing[2],
+                int(existing[3]),
+            )
+            if actual != expected:
+                raise ValueError(
+                    f"baseline session ID {session_id!r} already exists with conflicting metadata; "
+                    "use a new unique session ID rather than overwriting the existing session"
+                )
 
         self._writers["normal"].submit_sync(_op)
 

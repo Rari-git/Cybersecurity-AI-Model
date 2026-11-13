@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import threading
 
 import pytest
@@ -108,7 +109,7 @@ def test_v6_event_insert_failure_does_not_advance_sequence(tmp_path):
     try:
         mgr.register_verified_device_boot("gas_sensor_01", 2, BOOT_ID)
         # Unknown session violates the raw_events FK after freshness validation.
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.IntegrityError):
             mgr.persist_v6_normal_event(
                 _row("missing-session", 7), device_id="gas_sensor_01", certificate_generation=2,
                 boot_id=BOOT_ID, sequence=7, device_timestamp_ns=1_700_000_000_000_000_007,
@@ -280,5 +281,116 @@ def test_v6_boot_registration_rejects_downgrade_generation(tmp_path):
         state = mgr.load_device_freshness("gas_sensor_01")["gas_sensor_01"]
         assert state["certificate_generation"] == 3
         assert state["active_boot_id"] == BOOT_ID
+    finally:
+        mgr.close()
+
+
+def test_baseline_session_registration_is_idempotent_and_preserves_children(tmp_path):
+    mgr = _open_storage(tmp_path / "db")
+    try:
+        mgr.register_verified_device_boot("gas_sensor_01", 2, BOOT_ID)
+        mgr.persist_v6_normal_event(
+            _row("v6-live", 1), device_id="gas_sensor_01", certificate_generation=2,
+            boot_id=BOOT_ID, sequence=1, device_timestamp_ns=1_700_000_000_000_000_001,
+        )
+        mgr.mark_session_curated(
+            "v6-live", "pending", {"reason": "idempotency regression test"}
+        )
+        mgr.flush_all()
+
+        def snapshot():
+            conn = mgr.connect_readonly("normal")
+            try:
+                session = conn.execute(
+                    """SELECT started_at_ns, source_type, git_hash, config_json,
+                              approved_for_training
+                       FROM baseline_sessions WHERE session_id=?""",
+                    ("v6-live",),
+                ).fetchone()
+                event_count = conn.execute(
+                    "SELECT COUNT(*) FROM raw_events WHERE session_id=?", ("v6-live",)
+                ).fetchone()[0]
+                curation = conn.execute(
+                    """SELECT status, decision_json FROM session_curation
+                       WHERE session_id=?""",
+                    ("v6-live",),
+                ).fetchone()
+                return tuple(session), event_count, tuple(curation)
+            finally:
+                conn.close()
+
+        before = snapshot()
+        # Same identity and same immutable metadata: this must be a no-op.
+        mgr.register_baseline_session(
+            "v6-live", "live_validated", {"protocol": 6},
+            approved_for_training=False,
+        )
+        mgr.flush_all()
+        after = snapshot()
+
+        assert after == before
+        assert after[1] == 1
+        assert after[2][0] == "pending"
+    finally:
+        mgr.close()
+
+
+@pytest.mark.parametrize(
+    ("source_type", "config", "git_hash"),
+    [
+        ("live_validated", {"protocol": 7}, "v5.0-dev"),
+        ("live_validated", {"protocol": 6}, "different-git-hash"),
+        ("baseline_lab", {"protocol": 6}, "v5.0-dev"),
+    ],
+)
+def test_baseline_session_registration_rejects_conflicting_metadata_without_mutation(
+    tmp_path, source_type, config, git_hash
+):
+    mgr = _open_storage(tmp_path / "db")
+    try:
+        mgr.register_verified_device_boot("gas_sensor_01", 2, BOOT_ID)
+        mgr.persist_v6_normal_event(
+            _row("v6-live", 1), device_id="gas_sensor_01", certificate_generation=2,
+            boot_id=BOOT_ID, sequence=1, device_timestamp_ns=1_700_000_000_000_000_001,
+        )
+        mgr.flush_all()
+
+        conn = mgr.connect_readonly("normal")
+        try:
+            before_session = tuple(conn.execute(
+                """SELECT started_at_ns, source_type, git_hash, config_json,
+                          approved_for_training
+                   FROM baseline_sessions WHERE session_id=?""",
+                ("v6-live",),
+            ).fetchone())
+            before_events = conn.execute(
+                "SELECT COUNT(*) FROM raw_events WHERE session_id=?", ("v6-live",)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        with pytest.raises(ValueError, match="conflicting metadata"):
+            mgr.register_baseline_session(
+                "v6-live", source_type, config, git_hash=git_hash,
+                approved_for_training=False,
+            )
+
+        conn = mgr.connect_readonly("normal")
+        try:
+            after_session = tuple(conn.execute(
+                """SELECT started_at_ns, source_type, git_hash, config_json,
+                          approved_for_training
+                   FROM baseline_sessions WHERE session_id=?""",
+                ("v6-live",),
+            ).fetchone())
+            after_events = conn.execute(
+                "SELECT COUNT(*) FROM raw_events WHERE session_id=?", ("v6-live",)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        assert after_session == before_session
+        assert after_events == before_events == 1
+        assert mgr.load_device_freshness("gas_sensor_01")["gas_sensor_01"]["last_sequence"] == 1
     finally:
         mgr.close()
