@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "defaults": {
+    "rate_pps": 8.0,
+    "burst": 12.0,
+    "strike_threshold": 3,
+    "strike_window_sec": 30.0,
+    "strike_cooldown_sec": 1.0,
+    "block_ttl_sec": 45.0
+  },
+  "devices": [
+    {
+      "device_id": "door_sensor_01",
+      "cert_cn": "door_sensor_01",
+      "ingress_key": "ingest/devices/door_sensor_01/sensors/door/state",
+      "target_topic": "home/sensors/door/state",
+      "enabled": true,
+      "payload_type": "door"
+    },
+    {
+      "device_id": "gas_sensor_01",
+      "cert_cn": "gas_sensor_01",
+      "ingress_key": "ingest/devices/gas_sensor_01/sensors/gas/ppm",
+      "target_topic": "home/sensors/gas/ppm",
+      "enabled": true,
+      "payload_type": "gas"
+    },
+    {
+      "device_id": "gas_sensor_02",
+      "cert_cn": "gas_sensor_02",
+      "ingress_key": "ingest/devices/gas_sensor_02/sensors/gas/ppm",
+      "target_topic": "home/sensors/gas/ppm",
+      "enabled": true,
+      "payload_type": "gas"
+    },
+    {
+      "device_id": "vibration_sensor_01",
+      "cert_cn": "vibration_sensor_01",
+      "ingress_key": "ingest/devices/vibration_sensor_01/sensors/vibration/shock",
+      "target_topic": "home/sensors/vibration/shock",
+      "enabled": true,
+      "payload_type": "vibration"
+    },
+    {
+      "device_id": "pir_sensor_01",
+      "cert_cn": "pir_sensor_01",
+      "ingress_key": "ingest/devices/pir_sensor_01/sensors/pir/motion",
+      "target_topic": "home/sensors/pir/motion",
+      "enabled": true,
+      "payload_type": "pir"
+    }
+  ]
+}

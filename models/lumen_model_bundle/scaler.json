@@ -1,0 +1,45 @@
+{
+  "schema_version": "v5.0-f12",
+  "feature_names": [
+    "log_delta_t",
+    "rolling_rate",
+    "jitter_mad",
+    "dt_autocorr_lag1",
+    "burstiness_fano",
+    "payload_len",
+    "payload_entropy",
+    "value_norm",
+    "d_value_dt",
+    "trend_slope",
+    "adc_fractional_residual",
+    "protocol_anomaly_flag"
+  ],
+  "medians": [
+    0.693147,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    5.0,
+    1.921928,
+    0.022,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "iqrs": [
+    0.25,
+    0.25,
+    0.25,
+    0.25,
+    0.25,
+    3.0,
+    0.834419,
+    342.0,
+    0.25,
+    0.25,
+    0.1,
+    0.15
+  ]
+}

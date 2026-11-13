@@ -1,0 +1,101 @@
+{
+  mode: "router",
+  listen: { endpoints: ["tls/127.0.0.1:7447"] },
+  scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
+
+  transport: {
+    link: {
+      tls: {
+        root_ca_certificate: "config/certs/ca.pem",
+        listen_private_key: "config/certs/router.key",
+        listen_certificate: "config/certs/router.pem",
+        enable_mtls: true
+      }
+    }
+  },
+
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+
+    rules: [
+      // ---- publicare (client -> router)
+      { id: "in_put_device_door_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/door_sensor_01/sensors/door/state"] },
+      { id: "in_put_device_gas_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/gas_sensor_01/sensors/gas/ppm"] },
+      { id: "in_put_device_gas_sensor_02", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/gas_sensor_02/sensors/gas/ppm"] },
+      { id: "in_put_device_vibration_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/vibration_sensor_01/sensors/vibration/shock"] },
+      { id: "in_put_device_pir_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/pir_sensor_01/sensors/pir/motion"] },
+      { id: "in_put_ingest_actuators", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/actuators/**"] },
+      { id: "in_put_home_sensors",     messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/sensors/**"] },
+      { id: "in_put_home_actuators",   messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
+      { id: "in_put_alerts",           messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+      { id: "in_put_policy_ctrl",      messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
+      { id: "in_put_shadow_sandbox",   messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["shadow/sandbox/**"] },
+
+      // ---- livrare (router -> client)
+      { id: "out_put_ingest",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["ingest/**"] },
+      { id: "out_put_home",            messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/**"] },
+      { id: "out_put_actuator_cmd",    messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/actuators/**"] },
+      { id: "out_put_alerts",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/security/alerts"] },
+      { id: "out_put_policy_ctrl",     messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["control/policy/**"] },
+      { id: "out_put_shadow_sandbox",  messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["shadow/sandbox/**"] },
+
+      // ---- abonări
+      { id: "sub_ingest",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/**"] },
+      { id: "sub_home",                messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/**"] },
+      { id: "sub_actuator_cmd",        messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
+      { id: "sub_alerts",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+      { id: "sub_policy_ctrl",         messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["control/policy/**"] },
+      { id: "sub_shadow_sandbox",      messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["shadow/sandbox/**"] },
+
+      // ---- honeypot
+      { id: "honeypot_declare",        messages: ["declare_queryable"],  flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_query_in",       messages: ["query"],              flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_query_out",      messages: ["query"],              flows: ["egress"],  permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_reply_in",       messages: ["reply"],              flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_reply_out",      messages: ["reply"],              flows: ["egress"],  permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] }
+    ],
+
+    subjects: [
+      { id: "sensors",    cert_common_names: ["sensors"] },
+      { id: "controller", cert_common_names: ["controller"] },
+      { id: "gateway",    cert_common_names: ["gateway"] },
+      { id: "ids",        cert_common_names: ["ids"] },
+      { id: "honeypot",   cert_common_names: ["honeypot"] },
+      { id: "actuator",   cert_common_names: ["actuator"] },
+      { id: "dashboard",  cert_common_names: ["dashboard"] },
+      { id: "lab_tester", cert_common_names: ["lab_tester"] },
+      { id: "door_sensor_01", cert_common_names: ["door_sensor_01"] },
+      { id: "gas_sensor_01", cert_common_names: ["gas_sensor_01"] },
+      { id: "gas_sensor_02", cert_common_names: ["gas_sensor_02"] },
+      { id: "vibration_sensor_01", cert_common_names: ["vibration_sensor_01"] },
+      { id: "pir_sensor_01", cert_common_names: ["pir_sensor_01"] }
+    ],
+
+    policies: [
+      { rules: ["in_put_ingest_actuators", "in_put_policy_ctrl"], subjects: ["controller", "lab_tester"] },
+      { rules: ["in_put_device_door_sensor_01"], subjects: ["door_sensor_01"] },
+      { rules: ["in_put_device_gas_sensor_01"], subjects: ["gas_sensor_01"] },
+      { rules: ["in_put_device_gas_sensor_02"], subjects: ["gas_sensor_02"] },
+      { rules: ["in_put_device_vibration_sensor_01"], subjects: ["vibration_sensor_01"] },
+      { rules: ["in_put_device_pir_sensor_01"], subjects: ["pir_sensor_01"] },
+      { rules: [
+          "sub_ingest", "out_put_ingest",
+          "in_put_home_sensors", "in_put_home_actuators", "in_put_alerts",
+          "in_put_shadow_sandbox", "sub_policy_ctrl", "out_put_policy_ctrl"
+        ],
+        subjects: ["gateway"] },
+      { rules: ["sub_home", "out_put_home", "sub_ingest", "out_put_ingest", "in_put_alerts", "in_put_policy_ctrl"],
+        subjects: ["ids"] },
+      { rules: [
+          "honeypot_declare", "honeypot_query_out", "honeypot_reply_in", "honeypot_reply_out",
+          "in_put_alerts", "sub_shadow_sandbox", "out_put_shadow_sandbox"
+        ],
+        subjects: ["honeypot"] },
+      { rules: ["sub_actuator_cmd", "out_put_actuator_cmd"], subjects: ["actuator"] },
+      { rules: ["sub_alerts", "out_put_alerts", "sub_policy_ctrl", "out_put_policy_ctrl"], subjects: ["dashboard", "lab_tester"] },
+      { rules: ["honeypot_query_in", "honeypot_reply_out"],
+        subjects: ["sensors", "controller", "actuator", "dashboard", "lab_tester"] }
+    ]
+  }
+}

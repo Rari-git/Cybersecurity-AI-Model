@@ -1,0 +1,113 @@
+// Pornire:  python config/generate_certs.py  &&  zenohd -c config/zenoh_acl_example.json5
+// Patch 03: fiecare device poate publica doar pe cheia sa exacta ingest/devices/<id>/...;
+// DOAR gateway publică pe home/sensors/** și home/actuators/**.
+// Honeypot-ul are identitate PKI proprie (CN=honeypot): declară doar momelile și publică alerte,
+// fără nicio abonare pe magistralele de date (sub_home / sub_ingest / out_put_* NU sunt acordate).
+// Regulile "in_*" = trafic client -> router, "out_*" = router -> client.
+// default_permission = "deny": orice mesaj/cheie/flux care nu e permis explicit este refuzat.
+// "lab_tester" (atacurile de test) trebuie ȘTERS în producție.
+{
+  mode: "router",
+  listen: { endpoints: ["tls/127.0.0.1:7447"] },   // pe Pi: "tls/0.0.0.0:7447"
+  scouting: { multicast: { enabled: false }, gossip: { enabled: false } },
+
+  transport: {
+    link: {
+      tls: {
+        root_ca_certificate: "config/certs/ca.pem",
+        listen_private_key: "config/certs/router.key",
+        listen_certificate: "config/certs/router.pem",
+        enable_mtls: true
+      }
+    }
+  },
+
+  access_control: {
+    enabled: true,
+    default_permission: "deny",
+
+    rules: [
+      // ---- publicare (client -> router)
+      { id: "in_put_device_door_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/door_sensor_01/sensors/door/state"] },
+      { id: "in_put_device_gas_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/gas_sensor_01/sensors/gas/ppm"] },
+      { id: "in_put_device_gas_sensor_02", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/gas_sensor_02/sensors/gas/ppm"] },
+      { id: "in_put_device_vibration_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/vibration_sensor_01/sensors/vibration/shock"] },
+      { id: "in_put_device_pir_sensor_01", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/devices/pir_sensor_01/sensors/pir/motion"] },
+      { id: "in_put_ingest_actuators", messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/actuators/**"] },
+      // Publicarea pe home/** este separată pe categorii și atribuită EXCLUSIV subiectului "gateway".
+      { id: "in_put_home_sensors",     messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/sensors/**"] },
+      { id: "in_put_home_actuators",   messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
+      { id: "in_put_alerts",           messages: ["put"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+
+      // ---- livrare (router -> client)
+      { id: "out_put_ingest",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["ingest/**"] },
+      { id: "out_put_home",            messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/**"] },
+      { id: "out_put_actuator_cmd",    messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/actuators/**"] },
+      { id: "out_put_alerts",          messages: ["put"], flows: ["egress"],  permission: "allow", key_exprs: ["home/security/alerts"] },
+
+      // ---- abonări
+      { id: "sub_ingest",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["ingest/**"] },
+      { id: "sub_home",                messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/**"] },
+      { id: "sub_actuator_cmd",        messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/actuators/**"] },
+      { id: "sub_alerts",              messages: ["declare_subscriber"], flows: ["ingress"], permission: "allow", key_exprs: ["home/security/alerts"] },
+
+      // ---- honeypot: oricine autentificat poate SONDA capcanele (altfel scanarea nu declanșează alerta)
+      { id: "honeypot_declare",        messages: ["declare_queryable"],  flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_query_in",       messages: ["query"],              flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_query_out",      messages: ["query"],              flows: ["egress"],  permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_reply_in",       messages: ["reply"],              flows: ["ingress"], permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] },
+      { id: "honeypot_reply_out",      messages: ["reply"],              flows: ["egress"],  permission: "allow", key_exprs: ["home/admin/config", "home/security/keys", "system/internal/logs"] }
+    ],
+
+    // Subiectele se identifică după CN-ul certificatului de client.
+    // Dacă firmware-ul zenoh-pico (ESP32) nu suportă mTLS în versiunea voastră, înlocuiți
+    // cert_common_names cu usernames + authentication.usrpwd (verificați suportul în pico).
+    subjects: [
+      { id: "sensors",    cert_common_names: ["sensors"] },
+      { id: "controller", cert_common_names: ["controller"] },
+      { id: "gateway",    cert_common_names: ["gateway"] },
+      { id: "ids",        cert_common_names: ["ids"] },        // Faza 2: certificat distinct
+      { id: "honeypot",   cert_common_names: ["honeypot"] },   // Faza 2: certificat distinct
+      { id: "actuator",   cert_common_names: ["actuator"] },
+      { id: "dashboard",  cert_common_names: ["dashboard"] },
+      { id: "lab_tester", cert_common_names: ["lab_tester"] },
+      { id: "door_sensor_01", cert_common_names: ["door_sensor_01"] },
+      { id: "gas_sensor_01", cert_common_names: ["gas_sensor_01"] },
+      { id: "gas_sensor_02", cert_common_names: ["gas_sensor_02"] },
+      { id: "vibration_sensor_01", cert_common_names: ["vibration_sensor_01"] },
+      { id: "pir_sensor_01", cert_common_names: ["pir_sensor_01"] },
+    ],
+
+    policies: [
+      { rules: ["in_put_device_door_sensor_01"], subjects: ["door_sensor_01"] },
+      { rules: ["in_put_device_gas_sensor_01"], subjects: ["gas_sensor_01"] },
+      { rules: ["in_put_device_gas_sensor_02"], subjects: ["gas_sensor_02"] },
+      { rules: ["in_put_device_vibration_sensor_01"], subjects: ["vibration_sensor_01"] },
+      { rules: ["in_put_device_pir_sensor_01"], subjects: ["pir_sensor_01"] },
+      { rules: ["in_put_ingest_actuators"], subjects: ["controller", "lab_tester"] },
+
+      // SINGURUL subiect cu drept de publicare pe home/sensors/** și home/actuators/**
+      { rules: ["sub_ingest", "out_put_ingest", "in_put_home_sensors", "in_put_home_actuators", "in_put_alerts"],
+        subjects: ["gateway"] },
+
+      // IDS: doar abonare pasivă pe home/** și ingest/** + publicare alerte. Fără reguli honeypot_*.
+      { rules: ["sub_home", "out_put_home", "sub_ingest", "out_put_ingest", "in_put_alerts"],
+        subjects: ["ids"] },
+
+      // HONEYPOT: doar momelile + publicare alerte. FĂRĂ sub_home / sub_ingest / out_put_*:
+      // un honeypot compromis nu poate asculta senzorii sau comenzile actuatoarelor.
+      // honeypot_query_out e necesar ca routerul să livreze sondele către queryable-ul său.
+      { rules: ["honeypot_declare", "honeypot_query_out", "honeypot_reply_in", "honeypot_reply_out", "in_put_alerts"],
+        subjects: ["honeypot"] },
+
+      { rules: ["sub_actuator_cmd", "out_put_actuator_cmd"], subjects: ["actuator"] },
+      { rules: ["sub_alerts", "out_put_alerts"],             subjects: ["dashboard", "lab_tester"] },
+
+      // sondarea capcanelor, permisă tuturor nodurilor (inclusiv cele compromise)
+      { rules: ["honeypot_query_in", "honeypot_reply_out"],
+        subjects: ["sensors", "controller", "actuator", "dashboard", "lab_tester"] }
+    ]
+  }
+  // Fără plugins.rest (scrie/citește orice cheie prin HTTP și ocolește ACL-ul).
+}
+

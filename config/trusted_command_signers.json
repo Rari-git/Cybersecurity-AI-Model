@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "signers": {
+    "controller": {
+      "active_key_id": "controller-v1",
+      "keys": {
+        "controller-v1": {
+          "public_key": "command_keys/controller.public.pem",
+          "allowed_topics": [
+            "home/actuators/door/lock",
+            "home/actuators/garage/door"
+          ]
+        }
+      }
+    }
+  }
+}

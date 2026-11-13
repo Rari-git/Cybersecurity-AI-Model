@@ -1,0 +1,47 @@
+{
+  "calibration_method": "p98_val_l1_x1.25",
+  "global_threshold": 1.840713,
+  "stream_thresholds": {
+    "door_sensor_01::home/sensors/door/state": 1.111622,
+    "gas_sensor_01::home/sensors/gas/ppm": 2.556772,
+    "gas_sensor_02::home/sensors/gas/ppm": 2.259589,
+    "pir_sensor_01::home/sensors/pir/motion": 1.491961,
+    "vibration_sensor_01::home/sensors/vibration/shock": 0.868011
+  },
+  "xai_error_scales": [
+    0.25,
+    0.25,
+    0.25,
+    0.25,
+    0.277926,
+    0.25,
+    0.278667,
+    0.25,
+    3.613386,
+    0.663658,
+    0.25,
+    0.25
+  ],
+  "cusum_baselines": {
+    "door_sensor_01::home/sensors/door/state": {
+      "mean": 0.025625,
+      "std": 0.158014
+    },
+    "gas_sensor_01::home/sensors/gas/ppm": {
+      "mean": 352.50625,
+      "std": 13.986242
+    },
+    "gas_sensor_02::home/sensors/gas/ppm": {
+      "mean": 341.80375,
+      "std": 11.809011
+    },
+    "pir_sensor_01::home/sensors/pir/motion": {
+      "mean": 0.11625,
+      "std": 0.320524
+    },
+    "vibration_sensor_01::home/sensors/vibration/shock": {
+      "mean": 0.021274,
+      "std": 0.05
+    }
+  }
+}
