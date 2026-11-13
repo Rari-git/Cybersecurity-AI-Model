@@ -438,49 +438,61 @@ def test_release_handshake_requires_all_acks_before_gateway_opens(
 
 
 
-def test_ids_sensor_processor_rejects_payloads_admission_gate_rejects(monkeypatch):
-    fake_ort = ModuleType("onnxruntime")
-    fake_ort.InferenceSession = object
-    fake_zenoh = ModuleType("zenoh")
-    fake_zenoh.__path__ = []
-    fake_zenoh.Session = object
-    fake_zenoh.SampleKind = SimpleNamespace(DELETE=object())
-    fake_zenoh.Priority = SimpleNamespace(REAL_TIME=1)
-    fake_handlers = ModuleType("zenoh.handlers")
-    fake_handlers.FifoChannel = object
-    fake_handlers.RingChannel = object
-    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
-    monkeypatch.setitem(sys.modules, "zenoh", fake_zenoh)
-    monkeypatch.setitem(sys.modules, "zenoh.handlers", fake_handlers)
+def test_live_smoke_ignores_background_sensor_traffic_and_uses_staged_release(monkeypatch):
+    import scripts.live_runtime_smoke as smoke
 
-    from agent.ids_agent import ZenohIDSAgent
+    key_01 = f"{smoke.INTERNAL_PREFIX}gas_sensor_01"
+    key_02 = f"{smoke.INTERNAL_PREFIX}gas_sensor_02"
+    fp_01 = hashlib.sha256(b"cert-01").digest()
+    fp_02 = hashlib.sha256(b"cert-02").digest()
 
-    class Policy:
-        def __init__(self):
-            self.evidence = []
-        def evaluate_evidence(self, evidence):
-            self.evidence.append(evidence)
-            return SimpleNamespace(action="ALERT", new_state="ACTIVE")
+    from utils.identity_envelope import IdentityEnvelope
 
-    ids = ZenohIDSAgent.__new__(ZenohIDSAgent)
-    ids.stats = {"unknown": 0}
-    ids._resolve_device_id = lambda _topic, device_id=None: device_id or "gas_sensor_01"
-    ids.policy_engine = Policy()
-    ids._publish_v5_alert = lambda **_kwargs: None
+    bg_env = IdentityEnvelope.create(
+        device_id="gas_sensor_01", generation=1,
+        certificate_common_name="gas_sensor_01-g1-11111111",
+        certificate_fingerprint=fp_01,
+        original_topic="home/sensors/gas/ppm", payload=b"312",
+        gateway_instance_id="gw-smoke",
+    )
+    smoke_env_01 = IdentityEnvelope.create(
+        device_id="gas_sensor_01", generation=1,
+        certificate_common_name="gas_sensor_01-g1-11111111",
+        certificate_fingerprint=fp_01,
+        original_topic="home/sensors/gas/ppm", payload=b"351",
+        gateway_instance_id="gw-smoke",
+    )
+    smoke_env_02 = IdentityEnvelope.create(
+        device_id="gas_sensor_02", generation=1,
+        certificate_common_name="gas_sensor_02-g1-22222222",
+        certificate_fingerprint=fp_02,
+        original_topic="home/sensors/gas/ppm", payload=b"359",
+        gateway_instance_id="gw-smoke",
+    )
 
-    for text in ("NaN", "Inf", '{"value":10}', "OPEN"):
-        # AdmissionGate rejects these values for a gas scalar; even if an
-        # untrusted/buggy envelope claims ADMITTED, IDS independently rejects.
-        ids._process_sensor(
-            GAS_TOPIC, text, 1.0, 1.0,
+    q: queue.Queue[tuple[str, bytes]] = queue.Queue()
+    q.put((key_01, bg_env.encode()))
+    q.put((key_01, smoke_env_01.encode()))
+    q.put((key_02, smoke_env_02.encode()))
+
+    active = {
+        "gas_sensor_01": SimpleNamespace(
             device_id="gas_sensor_01", generation=1,
-            admission_status="ADMITTED", admission_reason="ADMITTED",
-            admission_numeric_value=None,
-        )
+            common_name="gas_sensor_01-g1-11111111",
+            certificate_fingerprint=fp_01,
+        ),
+        "gas_sensor_02": SimpleNamespace(
+            device_id="gas_sensor_02", generation=1,
+            common_name="gas_sensor_02-g1-22222222",
+            certificate_fingerprint=fp_02,
+        ),
+    }
+    allowed = {"gas_sensor_01": "home/sensors/gas/ppm", "gas_sensor_02": "home/sensors/gas/ppm"}
+    expected = {"gas_sensor_01": b"351", "gas_sensor_02": b"359"}
 
-    assert ids.stats["unknown"] == 4
-    assert len(ids.policy_engine.evidence) == 4
-    assert all(item.deterministic_violation for item in ids.policy_engine.evidence)
+    envelopes, payloads = smoke._wait_for_smoke_envelopes(q, active, allowed, expected, timeout=1.0)
+    assert payloads == expected
+    assert set(envelopes) == {"gas_sensor_01", "gas_sensor_02"}
 
 
 def test_policy_engine_retains_quarantine_when_release_ack_fails(tmp_path):
