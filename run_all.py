@@ -20,8 +20,10 @@ from ctypes import wintypes
 from pathlib import Path
 
 from utils.cert_lifecycle import CertAuthority, default_identities
-from utils.zenoh_router import build_router_config
+from utils.zenoh_router import build_router_config, validate_router_acl_template
 from utils.key_lifecycle import KeyAuthority, sweep_stale_sessions
+from models.bundle_loader import verify_and_load_bundle
+from models.model_lifecycle import resolve_active_bundle
 
 ROOT = Path(__file__).resolve().parent
 ZENOH_ENDPOINT = os.environ.get("LUMEN_ZENOH_ENDPOINT", "tls/127.0.0.1:7447")
@@ -29,6 +31,13 @@ SIGNER_TEMPLATE = Path(os.environ.get("LUMEN_COMMAND_SIGNER_TEMPLATE", ROOT / "c
 SIGNER_ID = os.environ.get("LUMEN_COMMAND_SIGNER_ID", "controller")
 ROUTER_TEMPLATE = Path(os.environ.get("LUMEN_ZENOH_ROUTER_CONFIG", ROOT / "config/zenohd_router.json5"))
 DEVICE_REGISTRY = Path(os.environ.get("LUMEN_DEVICE_REGISTRY", ROOT / "config/devices.json"))
+MODEL_ROOT = Path(os.environ.get("LUMEN_MODEL_ROOT", ROOT / "models")).resolve()
+ACTIVE_MODEL_POINTER = Path(os.environ.get(
+    "LUMEN_ACTIVE_MODEL_POINTER", MODEL_ROOT / "active_model.json"
+)).resolve()
+MODEL_PUBLIC_KEY = Path(os.environ.get(
+    "LUMEN_MODEL_PUBKEY", ROOT / "config/model_keys/model_signing_ed25519.pub"
+)).resolve()
 POLL_INTERVAL_SEC = float(os.environ.get("LUMEN_ROUTER_SUPERVISOR_POLL_SEC", "0.5"))
 
 REQUIRED_IDENTITIES = (
@@ -253,6 +262,11 @@ def preflight_or_exit() -> None:
         problems.append(f"signer template missing: {SIGNER_TEMPLATE}")
     if not ROUTER_TEMPLATE.is_file():
         problems.append(f"Zenoh router ACL template missing: {ROUTER_TEMPLATE}")
+    else:
+        try:
+            validate_router_acl_template(ROUTER_TEMPLATE)
+        except Exception as exc:
+            problems.append(f"Zenoh router ACL template failed E1/E2 validation: {exc}")
     if not DEVICE_REGISTRY.is_file():
         problems.append(f"device registry missing: {DEVICE_REGISTRY}")
     if not ZENOH_ENDPOINT.startswith("tls/"):
@@ -261,8 +275,34 @@ def preflight_or_exit() -> None:
         _find_zenohd()
     except FileNotFoundError as exc:
         problems.append(str(exc))
+    try:
+        resolve_verified_active_model_bundle()
+    except Exception as exc:
+        problems.append(f"signed active ONNX bundle unavailable: {exc}")
     if problems:
         raise SystemExit("Startup cancelled (fail-closed):\n  - " + "\n  - ".join(problems))
+
+
+def resolve_verified_active_model_bundle() -> Path:
+    """Resolve the active pointer and verify its Ed25519-signed ONNX bundle.
+
+    The launcher deliberately does not accept ``LUMEN_MODEL_BUNDLE_DIR`` as an
+    override: production must follow the atomic active-model pointer so a
+    candidate cannot be loaded merely because an inherited shell variable is
+    set.  IDS repeats bundle verification immediately before creating its ONNX
+    Runtime session.
+    """
+    if not MODEL_PUBLIC_KEY.is_file():
+        raise FileNotFoundError(f"model signing public key missing: {MODEL_PUBLIC_KEY}")
+    bundle_dir = resolve_active_bundle(
+        model_root=MODEL_ROOT,
+        pointer_path=ACTIVE_MODEL_POINTER,
+        fallback_bundle=MODEL_ROOT / "lumen_model_bundle",
+    )
+    verified = verify_and_load_bundle(bundle_dir, MODEL_PUBLIC_KEY)
+    if not verified.onnx_path.is_file():
+        raise FileNotFoundError(f"verified ONNX artifact is missing: {verified.onnx_path}")
+    return Path(bundle_dir).resolve()
 
 
 def provision_ephemeral_session(project_dir: Path):
@@ -299,9 +339,18 @@ def build_window_env(authority: KeyAuthority, cert_authority: CertAuthority, pro
         "LUMEN_TRUSTED_COMMAND_SIGNERS": str(authority.trust_path),
         "LUMEN_REVOKED_KEYS": str(authority.revocation_path),
         "LUMEN_REKEY_ENABLED": "1",
-        "LUMEN_CERT_POINTER": str(cert_authority.pointer_path),
-        "LUMEN_CERT_REVOCATIONS": str(cert_authority.revocation_path),
+        "LUMEN_CERT_POINTER": str(cert_authority.pointer_path.resolve()),
+        "LUMEN_CERT_REVOCATIONS": str(cert_authority.revocation_path.resolve()),
         "LUMEN_ZENOH_ENDPOINT": ZENOH_ENDPOINT,
+    }
+    # Pin IDS to the verified active pointer/key and disallow the legacy
+    # unbundled CUSUM-only fallback in the live stack.  Do not pass a resolved
+    # bundle directory: IDS must independently call resolve_active_bundle().
+    ids_model_env = {
+        "LUMEN_MODEL_ROOT": str(MODEL_ROOT),
+        "LUMEN_ACTIVE_MODEL_POINTER": str(ACTIVE_MODEL_POINTER),
+        "LUMEN_MODEL_PUBKEY": str(MODEL_PUBLIC_KEY),
+        "LUMEN_ALLOW_UNBUNDLED_FALLBACK": "0",
     }
 
     device_identities = [
@@ -318,7 +367,7 @@ def build_window_env(authority: KeyAuthority, cert_authority: CertAuthority, pro
 
     return {
         "Inline Gateway": client("gateway"),
-        "IDS Agent AI": client("ids"),
+        "IDS Agent AI": {**client("ids"), **ids_model_env},
         "Honeypot Sink": client("honeypot"),
         "Virtual Sensors": {
             **client("sensors"),
@@ -341,6 +390,21 @@ def build_window_env(authority: KeyAuthority, cert_authority: CertAuthority, pro
             "LUMEN_ZENOH_ENDPOINT": ZENOH_ENDPOINT,
         },
     }
+
+
+def build_child_env(title: str, envs: dict[str, dict[str, str]],
+                    parent_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Merge managed environment for one child, removing unsafe model overrides."""
+    child_env = dict(os.environ if parent_env is None else parent_env)
+    child_env.update(envs.get(title, {}))
+    if title == "IDS Agent AI":
+        # An inherited override would bypass the signed active-model pointer.
+        child_env.pop("LUMEN_MODEL_BUNDLE_DIR", None)
+        child_env.pop("LUMEN_ALLOW_EXPLICIT_MODEL_BUNDLE", None)
+        child_env["LUMEN_ALLOW_UNBUNDLED_FALLBACK"] = "0"
+    if title == "Meniu Atacuri":
+        child_env["LUMEN_ATTACK_PREFIX"] = "ingest"
+    return child_env
 
 
 class RouterSupervisor:
@@ -469,10 +533,7 @@ def launch_and_arrange_grid() -> int:
             )
 
         for idx, (title, command) in enumerate(_client_processes(project_dir), start=1):
-            env = os.environ.copy()
-            env.update(envs.get(title, {}))
-            if title == "Meniu Atacuri":
-                env["LUMEN_ATTACK_PREFIX"] = "ingest"
+            env = build_child_env(title, envs)
             process = _spawn_console_window(
                 command,
                 cwd=project_dir,
@@ -482,6 +543,35 @@ def launch_and_arrange_grid() -> int:
             )
             processes.append((title, process))
             log.info("launched %s pid=%s", title, process.pid)
+
+        if os.environ.get("LUMEN_RUN_LIVE_SMOKE", "0") == "1":
+            # Exercise the actual mTLS/Zenoh route only after Router, Gateway,
+            # IDS, and the virtual sensors have been started.  This short-lived
+            # verifier is intentionally not part of the long-running process
+            # monitor list.
+            smoke_env = os.environ.copy()
+            smoke_env.update({
+                "LUMEN_CERT_POINTER": str(cert_authority.pointer_path.resolve()),
+                "LUMEN_CERT_REVOCATIONS": str(cert_authority.revocation_path.resolve()),
+                "LUMEN_ZENOH_ENDPOINT": ZENOH_ENDPOINT,
+                "LUMEN_CERT_IDENTITY": "ids",
+                "LUMEN_CERT_ALLOWED_IDENTITIES": "ids,gas_sensor_01,gas_sensor_02",
+                "LUMEN_ENV": "production",
+            })
+            log.warning("[LIVE SMOKE] running real mTLS/Zenoh envelope + PEP ACK verification")
+            smoke_timeout = float(os.environ.get("LUMEN_LIVE_SMOKE_PROCESS_TIMEOUT_SEC", "90"))
+            completed = subprocess.run(
+                [sys.executable, str(project_dir / "scripts" / "live_runtime_smoke.py")],
+                cwd=str(project_dir),
+                env=smoke_env,
+                timeout=smoke_timeout,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(
+                    f"live mTLS/Zenoh smoke failed with exit code {completed.returncode}"
+                )
+            log.info("[LIVE SMOKE] PASS: shared-topic identities and correlated PEP ACKs verified")
 
         log.info("Lumen Edge Security running. Press Ctrl+C to shut down.")
         while not stop.wait(0.5):

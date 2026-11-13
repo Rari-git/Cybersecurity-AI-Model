@@ -25,3 +25,6 @@ psutil>=5.9.0
 # Testing & Validation
 pytest>=8.0.0
 onnxscript>=0.1.0
+
+# Fail-closed structural validation of the JSON5 Zenoh ACL template
+json5>=0.9.25
