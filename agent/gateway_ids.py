@@ -39,8 +39,9 @@ from utils.mtls_hot_reload import open_mtls_client
 from utils.cert_lifecycle import revoke_active_certificate
 from utils.device_registry import DeviceRegistry
 from utils.device_security import DeviceSecurityManager
-from utils.device_identity import load_active_device_identity
+from utils.device_identity import load_active_device_identity, load_active_device_signing_key
 from utils.identity_envelope import IdentityEnvelope
+from utils.sensor_payload import parse_sensor_frame, MAX_SENSOR_FRAME_BYTES
 from utils.key_lifecycle import KeyHealthMonitor, RevocationLedger
 
 MAX_PAYLOAD_BYTES = 512
@@ -621,14 +622,14 @@ class ZenohInlineGateway:
             reported_size = len(payload)
         except (TypeError, AttributeError):
             reported_size = None
-        if reported_size is not None and reported_size > MAX_PAYLOAD_BYTES:
+        if reported_size is not None and reported_size > MAX_SENSOR_FRAME_BYTES:
             self._inc("oversize_dropped")
             self._register_device_violation(
                 spec.device_id, target, "Anomalous Payload", f"oversize {reported_size}B"
             )
             return
         raw = payload.to_bytes() if hasattr(payload, "to_bytes") else bytes(payload)
-        if len(raw) > MAX_PAYLOAD_BYTES:
+        if len(raw) > MAX_SENSOR_FRAME_BYTES:
             self._inc("oversize_dropped")
             self._register_device_violation(
                 spec.device_id, target, "Anomalous Payload", f"oversize {len(raw)}B"
@@ -670,26 +671,58 @@ class ZenohInlineGateway:
             cert_fingerprint=identity.certificate_fingerprint, source_type="live_validated",
             device_id=device_id, generation=identity.generation,
         )
-        # AdmissionGate persists admitted rows or rejected evidence synchronously.
-        # Any queue/SQLite failure propagates to the worker callback and fails closed.
-        admission = self.admission_gate.evaluate_and_ingest(ctx, target, raw)
+        # Detect V6 framed telemetry without changing the existing V5 scalar path.
+        # Malformed V6 frames are incident-captured by the Gate and are never
+        # forwarded as model input.
+        v6_frame = None
+        try:
+            frame_doc = json.loads(raw.decode("utf-8"))
+            is_v6 = isinstance(frame_doc, dict) and frame_doc.get("protocol_version") == 6
+        except (UnicodeError, json.JSONDecodeError):
+            is_v6 = False
+        if is_v6:
+            parsed_frame = parse_sensor_frame(target, raw, expected_device_id=device_id)
+            if not parsed_frame.valid or parsed_frame.frame is None:
+                admission = self.admission_gate.evaluate_v6_and_ingest(ctx, target, raw)
+                self._inc("sensor_invalid_dropped")
+                logger.warning("[V6 FRAME REJECTED] device=%s reason=%s", sanitize(device_id, 64), admission.reason)
+                return
+            v6_frame = parsed_frame.frame
+            admission = self.admission_gate.evaluate_v6_and_ingest(ctx, target, raw)
+            envelope_payload = v6_frame.canonical_text.encode("utf-8")
+        else:
+            # AdmissionGate persists admitted rows or rejected evidence synchronously.
+            # Any queue/SQLite failure propagates to the worker callback and fails closed.
+            admission = self.admission_gate.evaluate_and_ingest(ctx, target, raw)
+            envelope_payload = raw
         if not admission.admitted:
             self._inc("sensor_invalid_dropped")
 
-        # The router ACL grants internal envelope publication to the Gateway only.
-        # IDS verifies the envelope's claims against its independently read active PKI.
-        envelope = IdentityEnvelope.create(
+        # Internal envelope publication is Gateway-only by ACL. V6 adds an
+        # RSA-PSS signature from the active Gateway leaf key, verified by IDS.
+        envelope_args = dict(
             device_id=device_id, generation=identity.generation,
             certificate_common_name=identity.common_name,
             certificate_fingerprint=identity.certificate_fingerprint,
-            original_topic=target, payload=raw, gateway_instance_id=self.run_id,
+            original_topic=target, payload=envelope_payload, gateway_instance_id=self.run_id,
             admission_status="ADMITTED" if admission.admitted else "REJECTED",
             admission_reason=admission.reason,
             admission_numeric_value=admission.numeric_value,
         )
+        if v6_frame is not None:
+            gateway_identity, gateway_signing_key = load_active_device_signing_key(self.cert_pointer, "gateway")
+            envelope_args.update(
+                protocol_version=6,
+                boot_id=v6_frame.boot_id,
+                sequence=v6_frame.sequence,
+                device_timestamp_ns=v6_frame.device_timestamp_ns,
+                gateway_identity=gateway_identity,
+                gateway_signing_key=gateway_signing_key,
+            )
+        envelope = IdentityEnvelope.create(**envelope_args)
         self.session.put(f"{INTERNAL_TELEMETRY_PREFIX}{device_id}", envelope.encode())
 
-        # Public topics receive only the canonical form accepted by AdmissionGate.
+        # Public topics receive only canonical values accepted by AdmissionGate.
         if admission.admitted:
             canonical_raw = str(admission.canonical_text).encode("utf-8")
             self.session.put(target, canonical_raw)

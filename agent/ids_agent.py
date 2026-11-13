@@ -55,6 +55,7 @@ from utils.device_identity import load_active_device_identity
 from utils.cert_lifecycle import CertRevocationLedger, revoke_active_certificate
 from utils.identity_envelope import (
     IdentityEnvelope, validate_active_identity, validate_envelope_route,
+    validate_gateway_binding,
 )
 from models.model_lifecycle import resolve_active_bundle
 from utils.crypto_utils import CommandSigner
@@ -273,6 +274,9 @@ class ZenohIDSAgent:
         validate_envelope_route(env, key, self._device_to_topic)
         identity = load_active_device_identity(self.cert_pointer, env.device_id)
         validate_active_identity(env, identity)
+        if env.protocol_version == 6:
+            gateway_identity = load_active_device_identity(self.cert_pointer, "gateway")
+            validate_gateway_binding(env, gateway_identity)
         return env, payload
 
     def _on_pep_ack(self, sample) -> None:

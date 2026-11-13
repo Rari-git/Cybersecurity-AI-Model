@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS raw_events (
     raw_payload TEXT NOT NULL,
     source_type TEXT NOT NULL CHECK(source_type IN ('baseline_lab', 'live_validated')),
     admission_policy_version TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL DEFAULT 5 CHECK(protocol_version IN (5, 6)),
+    boot_id TEXT,
+    sequence INTEGER,
     FOREIGN KEY (session_id) REFERENCES baseline_sessions(session_id)
 );
 
@@ -43,6 +46,16 @@ CREATE INDEX IF NOT EXISTS idx_normal_raw_dev_topic_ts
     ON raw_events(device_id, topic, gateway_ts_ns);
 CREATE INDEX IF NOT EXISTS idx_normal_raw_session
     ON raw_events(session_id);
+-- Durable sensor freshness state is kept beside raw_events so freshness
+-- advancement and telemetry insertion can share one SQLite transaction.
+CREATE TABLE IF NOT EXISTS device_freshness (
+    device_id TEXT PRIMARY KEY,
+    certificate_generation INTEGER NOT NULL CHECK(certificate_generation > 0),
+    active_boot_id TEXT NOT NULL CHECK(length(active_boot_id) = 32),
+    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0),
+    last_device_timestamp_ns INTEGER,
+    updated_at_ns INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS windows (
     window_id INTEGER PRIMARY KEY AUTOINCREMENT,

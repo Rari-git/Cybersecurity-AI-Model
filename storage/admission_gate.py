@@ -17,11 +17,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from storage.telemetry_db import LumenStorageManager
+from storage.telemetry_db import LumenStorageManager, FreshnessRejected
 from storage.persistence import persist_normal_event, persist_incident_capture
 from utils.sensor_payload import (
     MAX_SENSOR_PAYLOAD_BYTES, TOPIC_PHYSICAL_BOUNDS, DISCRETE_TOPIC_VALUES,
-    parse_sensor_payload,
+    parse_sensor_payload, parse_sensor_frame, normalize_boot_id, MAX_SENSOR_FRAME_BYTES,
 )
 
 MAX_RAW_PAYLOAD_BYTES = MAX_SENSOR_PAYLOAD_BYTES
@@ -47,6 +47,10 @@ class AdmissionResult:
     reason: str
     numeric_value: Optional[float] = None
     canonical_text: Optional[str] = None
+    protocol_version: int = 5
+    boot_id: Optional[str] = None
+    sequence: Optional[int] = None
+    device_timestamp_ns: Optional[int] = None
 
 
 def parse_device_identity(device_cn: str) -> tuple[str, int]:
@@ -165,6 +169,111 @@ class AdmissionGate:
         return AdmissionResult(
             True, device_id, generation, "ADMITTED",
             numeric_value=num_val, canonical_text=parsed.canonical_text,
+        )
+
+    def register_verified_device_boot(self, ctx: ProvenanceContext, boot_id: str) -> None:
+        """Persist a new V6 boot epoch after a separate challenge proof succeeds.
+
+        The authenticated caller must verify a fresh, single-use Gateway
+        challenge with the active device certificate before calling this method.
+        A frame's self-asserted boot_id is never sufficient to reset sequence state.
+        """
+        parsed_device_id, parsed_generation = parse_device_identity(ctx.device_cn)
+        device_id = ctx.device_id or parsed_device_id
+        generation = ctx.generation if ctx.generation is not None else parsed_generation
+        if device_id != parsed_device_id or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError("boot registration identity does not match authenticated certificate CN")
+        if len(ctx.cert_fingerprint) != 32:
+            raise ValueError("boot registration requires a SHA-256 certificate fingerprint")
+        if ctx.source_type not in ("baseline_lab", "live_validated"):
+            raise ValueError("boot registration source is not trusted")
+        self.storage.register_verified_device_boot(device_id, generation, normalize_boot_id(boot_id))
+
+    def evaluate_v6_and_ingest(
+        self,
+        ctx: ProvenanceContext,
+        topic: str,
+        raw_frame: bytes | str,
+    ) -> AdmissionResult:
+        """Validate a V6 frame and atomically persist it with its sequence update."""
+        frame_bytes = raw_frame if isinstance(raw_frame, bytes) else str(raw_frame).encode("utf-8", errors="strict")
+        gateway_ts_ns = time.time_ns()
+        frame_sha = hashlib.sha256(frame_bytes).digest()
+        try:
+            parsed_device_id, parsed_generation = parse_device_identity(ctx.device_cn)
+            device_id = ctx.device_id or parsed_device_id
+            generation = ctx.generation if ctx.generation is not None else parsed_generation
+            if device_id != parsed_device_id:
+                raise ValueError("certificate CN does not match stable device_id")
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                raise ValueError("invalid certificate generation")
+        except ValueError as exc:
+            return AdmissionResult(False, "unknown", 0, str(exc), protocol_version=6)
+
+        if len(ctx.cert_fingerprint) != 32:
+            return AdmissionResult(False, device_id, generation, "INVALID_CERT_FINGERPRINT", protocol_version=6)
+        if ctx.source_type not in ("baseline_lab", "live_validated"):
+            return AdmissionResult(False, device_id, generation, f"UNTRUSTED_SOURCE:{ctx.source_type}", protocol_version=6)
+
+        parsed_frame = parse_sensor_frame(topic, raw_frame, expected_device_id=device_id)
+        if not parsed_frame.valid or parsed_frame.frame is None:
+            self._route_rejected_to_incidents(
+                ctx, device_id, generation, topic, gateway_ts_ns, None,
+                frame_bytes[:MAX_SENSOR_FRAME_BYTES], frame_sha, f"INVALID_V6_FRAME:{parsed_frame.reason}",
+            )
+            return AdmissionResult(False, device_id, generation, f"INVALID_V6_FRAME:{parsed_frame.reason}", protocol_version=6)
+        frame = parsed_frame.frame
+
+        if device_id in self._blocked_devices:
+            reason = "DEVICE_QUARANTINED_OR_INCIDENT"
+            self._route_rejected_to_incidents(
+                ctx, device_id, generation, topic, gateway_ts_ns, frame.device_timestamp_ns,
+                frame_bytes, frame_sha, reason,
+            )
+            return AdmissionResult(False, device_id, generation, reason, protocol_version=6,
+                                  boot_id=frame.boot_id, sequence=frame.sequence,
+                                  device_timestamp_ns=frame.device_timestamp_ns)
+        if topic not in self.allowed_topics.get(device_id, set()):
+            reason = "UNAUTHORIZED_TOPIC_FOR_DEVICE"
+            self._route_rejected_to_incidents(
+                ctx, device_id, generation, topic, gateway_ts_ns, frame.device_timestamp_ns,
+                frame_bytes, frame_sha, reason,
+            )
+            return AdmissionResult(False, device_id, generation, reason, protocol_version=6,
+                                  boot_id=frame.boot_id, sequence=frame.sequence,
+                                  device_timestamp_ns=frame.device_timestamp_ns)
+
+        canonical_bytes = frame.canonical_text.encode("utf-8")
+        canonical_sha = hashlib.sha256(canonical_bytes).digest()
+        row = (
+            ctx.session_id, device_id, ctx.device_cn, generation, ctx.cert_fingerprint,
+            topic, gateway_ts_ns, frame.device_timestamp_ns, len(canonical_bytes),
+            canonical_sha, frame.numeric_value, frame.canonical_text, ctx.source_type,
+            ctx.admission_policy_version, 6, frame.boot_id, frame.sequence,
+        )
+        try:
+            self.storage.persist_v6_normal_event(
+                row,
+                device_id=device_id,
+                certificate_generation=generation,
+                boot_id=frame.boot_id,
+                sequence=frame.sequence,
+                device_timestamp_ns=frame.device_timestamp_ns,
+            )
+        except FreshnessRejected as exc:
+            self._route_rejected_to_incidents(
+                ctx, device_id, generation, topic, gateway_ts_ns, frame.device_timestamp_ns,
+                frame_bytes, frame_sha, exc.reason_code,
+            )
+            return AdmissionResult(False, device_id, generation, exc.reason_code,
+                                  numeric_value=frame.numeric_value, canonical_text=frame.canonical_text,
+                                  protocol_version=6, boot_id=frame.boot_id, sequence=frame.sequence,
+                                  device_timestamp_ns=frame.device_timestamp_ns)
+
+        return AdmissionResult(
+            True, device_id, generation, "ADMITTED", numeric_value=frame.numeric_value,
+            canonical_text=frame.canonical_text, protocol_version=6, boot_id=frame.boot_id,
+            sequence=frame.sequence, device_timestamp_ns=frame.device_timestamp_ns,
         )
 
     def _route_rejected_to_incidents(

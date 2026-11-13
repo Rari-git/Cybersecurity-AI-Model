@@ -23,6 +23,14 @@ GENESIS_HASH = "0" * 64
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
+class FreshnessRejected(ValueError):
+    """A V6 sensor frame failed the durable boot/sequence admission checks."""
+
+    def __init__(self, reason_code: str, detail: str = ""):
+        self.reason_code = reason_code
+        super().__init__(f"{reason_code}{': ' + detail if detail else ''}")
+
+
 @dataclass(frozen=True)
 class DBPaths:
     normal_db: Path
@@ -83,7 +91,9 @@ class _SingleWriterWorker:
         conn: Optional[sqlite3.Connection] = None
         try:
             conn = sqlite3.connect(str(self.db_path), timeout=10.0, isolation_level=None)
+            conn.execute("PRAGMA busy_timeout = 10000")
             conn.executescript(self._schema_sql)
+            self._ensure_schema_migrations(conn)
             self._ready.set()
 
             while True:
@@ -132,6 +142,35 @@ class _SingleWriterWorker:
                 except sqlite3.Error:
                     pass
                 conn.close()
+
+    def _ensure_schema_migrations(self, conn: sqlite3.Connection) -> None:
+        """Apply additive migrations for existing V5 databases without data loss."""
+        if self.db_path.name != "telemetry_normal.db":
+            return
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
+        additions = {
+            "protocol_version": "INTEGER NOT NULL DEFAULT 5 CHECK(protocol_version IN (5, 6))",
+            "boot_id": "TEXT",
+            "sequence": "INTEGER",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE raw_events ADD COLUMN {name} {declaration}")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_v6_raw_device_boot_sequence "
+            "ON raw_events(device_id, generation, boot_id, sequence) "
+            "WHERE boot_id IS NOT NULL AND sequence IS NOT NULL"
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS device_freshness (
+                device_id TEXT PRIMARY KEY,
+                certificate_generation INTEGER NOT NULL CHECK(certificate_generation > 0),
+                active_boot_id TEXT NOT NULL CHECK(length(active_boot_id) = 32),
+                last_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_sequence >= 0),
+                last_device_timestamp_ns INTEGER,
+                updated_at_ns INTEGER NOT NULL
+            )"""
+        )
 
     def _fail_queued_callers(self, error: BaseException) -> None:
         """Wake every queued synchronous submitter if the worker dies."""
@@ -318,6 +357,151 @@ class LumenStorageManager:
             )
 
         return self._writers["normal"].submit_async(_op)
+
+    def register_verified_device_boot(
+        self, device_id: str, certificate_generation: int, boot_id: str,
+    ) -> None:
+        """Activate a boot epoch after the caller has verified its boot challenge.
+
+        This method is the persistence half of the boot-registration protocol.
+        Callers MUST authenticate a fresh, single-use Gateway challenge with the
+        active device certificate before invoking it. Re-registering the same
+        epoch is idempotent; a new epoch resets its sequence to zero.
+        """
+        from utils.sensor_payload import normalize_boot_id
+
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 64:
+            raise ValueError("invalid device_id")
+        if (isinstance(certificate_generation, bool) or not isinstance(certificate_generation, int)
+                or certificate_generation < 1):
+            raise ValueError("certificate_generation must be a positive integer")
+        normalized_boot_id = normalize_boot_id(boot_id)
+        now_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> None:
+            current = conn.execute(
+                "SELECT certificate_generation, active_boot_id FROM device_freshness WHERE device_id=?",
+                (device_id,),
+            ).fetchone()
+            if current is not None:
+                current_generation = int(current[0])
+                if certificate_generation < current_generation:
+                    raise FreshnessRejected("STALE_CERTIFICATE_GENERATION")
+                if (certificate_generation == current_generation
+                        and str(current[1]) == normalized_boot_id):
+                    return
+            conn.execute(
+                """INSERT INTO device_freshness
+                   (device_id, certificate_generation, active_boot_id, last_sequence,
+                    last_device_timestamp_ns, updated_at_ns)
+                   VALUES (?, ?, ?, 0, NULL, ?)
+                   ON CONFLICT(device_id) DO UPDATE SET
+                     certificate_generation=excluded.certificate_generation,
+                     active_boot_id=excluded.active_boot_id,
+                     last_sequence=0,
+                     last_device_timestamp_ns=NULL,
+                     updated_at_ns=excluded.updated_at_ns""",
+                (device_id, certificate_generation, normalized_boot_id, now_ns),
+            )
+
+        self._writers["normal"].submit_sync(_op, timeout=10.0)
+
+    def persist_v6_normal_event(
+        self,
+        row: tuple[Any, ...],
+        *,
+        device_id: str,
+        certificate_generation: int,
+        boot_id: str,
+        sequence: int,
+        device_timestamp_ns: int,
+    ) -> int:
+        """Atomically check freshness, persist a normal event, and advance sequence.
+
+        The writer wraps this callable in ``BEGIN IMMEDIATE``/``COMMIT``. Any
+        freshness or INSERT failure rolls the whole transaction back, so the
+        counter cannot advance without its matching telemetry row (or vice versa).
+        ``row`` contains the existing 14 V5 raw_events values, followed by
+        protocol_version, boot_id and sequence.
+        """
+        from utils.sensor_payload import normalize_boot_id, MAX_SEQUENCE, MAX_DEVICE_TIMESTAMP_NS
+
+        normalized_boot_id = normalize_boot_id(boot_id)
+        if isinstance(certificate_generation, bool) or not isinstance(certificate_generation, int) or certificate_generation < 1:
+            raise ValueError("invalid certificate generation")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or not 1 <= sequence <= MAX_SEQUENCE:
+            raise ValueError("invalid sequence")
+        if isinstance(device_timestamp_ns, bool) or not isinstance(device_timestamp_ns, int) or not 1 <= device_timestamp_ns <= MAX_DEVICE_TIMESTAMP_NS:
+            raise ValueError("invalid device timestamp")
+        if len(row) != 17:
+            raise ValueError("V6 raw event row must contain 17 values")
+        if (row[1] != device_id or row[3] != certificate_generation
+                or row[7] != device_timestamp_ns or row[14] != 6
+                or row[15] != normalized_boot_id or row[16] != sequence):
+            raise ValueError("V6 raw event row metadata does not match freshness arguments")
+        now_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> int:
+            state = conn.execute(
+                """SELECT certificate_generation, active_boot_id, last_sequence
+                   FROM device_freshness WHERE device_id=?""",
+                (device_id,),
+            ).fetchone()
+            if state is None:
+                raise FreshnessRejected("BOOT_NOT_REGISTERED")
+            if int(state[0]) != certificate_generation:
+                raise FreshnessRejected("CERTIFICATE_GENERATION_MISMATCH")
+            if str(state[1]) != normalized_boot_id:
+                raise FreshnessRejected("STALE_BOOT_ID")
+            previous_sequence = int(state[2])
+            if sequence <= previous_sequence:
+                raise FreshnessRejected("REPLAY_OR_OUT_OF_ORDER_SEQUENCE")
+
+            conn.execute(
+                """INSERT INTO raw_events (
+                    session_id, device_id, device_cn, generation, cert_fingerprint,
+                    topic, gateway_ts_ns, device_ts_ns, payload_len, payload_sha256,
+                    numeric_value, raw_payload, source_type, admission_policy_version,
+                    protocol_version, boot_id, sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row,
+            )
+            conn.execute(
+                """UPDATE device_freshness SET last_sequence=?, last_device_timestamp_ns=?,
+                   updated_at_ns=? WHERE device_id=?""",
+                (sequence, device_timestamp_ns, now_ns, device_id),
+            )
+            return previous_sequence
+
+        return int(self._writers["normal"].submit_sync(_op, timeout=10.0))
+
+    def load_device_freshness(self, device_id: str | None = None) -> dict[str, dict[str, Any]]:
+        """Read durable active boot/sequence checkpoints for diagnostics and recovery."""
+        conn = self.connect_readonly("normal")
+        try:
+            if device_id is None:
+                rows = conn.execute(
+                    "SELECT device_id, certificate_generation, active_boot_id, last_sequence, "
+                    "last_device_timestamp_ns FROM device_freshness"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT device_id, certificate_generation, active_boot_id, last_sequence, "
+                    "last_device_timestamp_ns FROM device_freshness WHERE device_id=?",
+                    (device_id,),
+                ).fetchall()
+            return {
+                str(row["device_id"]): {
+                    "certificate_generation": int(row["certificate_generation"]),
+                    "active_boot_id": str(row["active_boot_id"]),
+                    "last_sequence": int(row["last_sequence"]),
+                    "last_device_timestamp_ns": (int(row["last_device_timestamp_ns"])
+                                                   if row["last_device_timestamp_ns"] is not None else None),
+                }
+                for row in rows
+            }
+        finally:
+            conn.close()
 
     def enqueue_normal_window(self, row: tuple[Any, ...]) -> bool:
         def _op(conn: sqlite3.Connection) -> None:
