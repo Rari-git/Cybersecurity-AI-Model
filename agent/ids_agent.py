@@ -48,6 +48,8 @@ from utils.features_v5 import (
 )
 from utils.xai_explainer import NormalizedXaiExplainer
 from utils.device_registry import DeviceRegistry
+from utils.device_identity import load_active_device_identity
+from models.model_lifecycle import resolve_active_bundle
 from utils.crypto_utils import CommandSigner
 from utils.replay_store import ReplayStore
 from utils.rate_limit import TokenBucketRateLimiter
@@ -98,14 +100,18 @@ class ZenohIDSAgent:
             enable_writers=True,
         )
         for spec in self.registry.enabled_devices():
-            fp = hashlib.sha256(spec.device_id.encode("utf-8")).digest()
+            pointer = os.environ.get("LUMEN_CERT_POINTER")
+            if not pointer:
+                raise RuntimeError("LUMEN_CERT_POINTER is required to bind devices to real certificates")
+            identity = load_active_device_identity(pointer, spec.device_id)
             self.storage.upsert_device(
                 device_id=spec.device_id,
-                generation=1,
-                current_cn=spec.device_id,
-                cert_fingerprint=fp,
+                generation=identity.generation,
+                device_cn=identity.common_name,
+                cert_fingerprint=identity.certificate_fingerprint,
                 device_role="sensor",
                 criticality=self._device_criticality[spec.device_id],
+                state="ACTIVE",
             )
 
         self.ml_enabled = False
@@ -117,7 +123,15 @@ class ZenohIDSAgent:
         self.scaler: RobustFeatureScaler | None = None
         self.xai: NormalizedXaiExplainer | None = None
 
-        bdir = Path(os.environ.get("LUMEN_MODEL_BUNDLE_DIR", bundle_dir))
+        explicit_bundle = os.environ.get("LUMEN_MODEL_BUNDLE_DIR")
+        if explicit_bundle:
+            bdir = Path(explicit_bundle)
+        else:
+            bdir = resolve_active_bundle(
+                model_root="models",
+                pointer_path=os.environ.get("LUMEN_ACTIVE_MODEL_POINTER", "models/active_model.json"),
+                fallback_bundle=bundle_dir,
+            )
         pkey = Path(os.environ.get("LUMEN_MODEL_PUBKEY", pub_key_path))
         allow_fallback = os.environ.get("LUMEN_ALLOW_UNBUNDLED_FALLBACK", "1") == "1"
 

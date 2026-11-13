@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -129,14 +130,18 @@ def _extract_windows_by_session(
 
 def train_and_export_bundle(
     db_dir: str | Path = "logs/db",
-    bundle_dir: str | Path = "models/lumen_model_bundle",
+    bundle_dir: str | Path | None = None,
     key_dir: str | Path = "config/model_keys",
     seq_len: int = 16,
     epochs: int = 35,
     batch_size: int = 64,
     lr: float = 2e-3,
     seed: int = 42,
+    run_id: str | None = None,
 ) -> dict:
+    run_id = run_id or uuid.uuid4().hex
+    if bundle_dir is None:
+        bundle_dir = Path("models") / "candidates" / run_id
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -273,13 +278,16 @@ def train_and_export_bundle(
     priv_key = kdir / "model_signing_ed25519.key"
     pub_key = kdir / "model_signing_ed25519.pub"
     if not priv_key.is_file() or not pub_key.is_file():
-        generate_model_signing_keypair(priv_key, pub_key)
+        raise RuntimeError(
+            "Model signing keypair is not provisioned. Create it offline; "
+            "training must never replace the runtime trust anchor automatically."
+        )
 
     manifest = sign_model_bundle(
         bdir,
         priv_key,
         metadata={
-            "model_version": "v5.0.0",
+            "model_version": f"v5-candidate-{run_id}",
             "architecture": "TemporalLSTMAutoencoder(12->32->16->32->12)",
             "feature_schema_version": FEATURE_SCHEMA_VERSION,
             "trained_at_unix": int(time.time()),
@@ -297,7 +305,8 @@ def train_and_export_bundle(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train local LSTM Autoencoder and sign ONNX bundle.")
     parser.add_argument("--db-dir", default="logs/db")
-    parser.add_argument("--bundle-dir", default="models/lumen_model_bundle")
+    parser.add_argument("--bundle-dir", default=None,
+                        help="Optional explicit output; default is models/candidates/<run_id>")
     parser.add_argument("--key-dir", default="config/model_keys")
     parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--seq-len", type=int, default=16)

@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from models.bundle_loader import verify_and_load_bundle
+from models.model_lifecycle import resolve_active_bundle
 from utils.features_v5 import DeviceTopicFeatureExtractor, RobustFeatureScaler
 from agent.statistical_detectors import TwoSidedCusumDetector, OperationalFaultClassifier
 from agent.policy_engine import RiskPolicyEngine, DetectionEvidence
@@ -40,10 +41,12 @@ EXPECTED_XAI_FEATURES: dict[str, set[str]] = {
 
 
 def run_benchmark(
-    bundle_dir: str | Path = "models/lumen_model_bundle",
+    bundle_dir: str | Path | None = None,
     pub_key_path: str | Path = "config/model_keys/model_signing_ed25519.pub",
     output_json: str | Path = "logs/evaluation_v5_report.json",
 ) -> dict:
+    if bundle_dir is None:
+        bundle_dir = resolve_active_bundle(model_root="models", pointer_path="models/active_model.json", fallback_bundle="models/lumen_model_bundle")
     bundle = verify_and_load_bundle(bundle_dir, pub_key_path)
     ort_sess = ort.InferenceSession(str(bundle.onnx_path), providers=["CPUExecutionProvider"])
     scaler = RobustFeatureScaler.from_dict(bundle.scaler)
@@ -137,13 +140,9 @@ def run_benchmark(
                 if report.is_anomalous:
                     lstm_flag = True
 
-                # În scenariile de atac held-out, anomalia este cibernetică; în scenariile de defecțiune,
-                # clasificatorul operațional separă defectul tehnic de carantina cibernetică
-                effective_op_status = (
-                    "FAULT" if (sc_id in fault_scenarios and fault_flag) else (
-                        "HEALTHY" if sc_id in heldout_attacks else op_health.status
-                    )
-                )
+                # Ground truth/scenario identity is evaluation-only. Policy sees
+                # only the operational classifier's observable output.
+                effective_op_status = op_health.status
 
                 decision = policy.evaluate_evidence(
                     DetectionEvidence(

@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from simulation.capture_baseline import run_baseline_capture
 from training.train_local_lstm import train_and_export_bundle
+from models.bundle_loader import generate_model_signing_keypair
 from models.bundle_loader import verify_and_load_bundle
 
 
@@ -31,7 +32,9 @@ def test_e5_train_export_sign_and_tamper_detection():
         # 1. Generăm 3 sesiuni curate (2 train + 1 val)
         run_baseline_capture(db_dir=db_dir, sessions=3, events_per_sensor=60, seed=42)
 
-        # 2. Antrenăm, exportăm ONNX și semnăm manifestul
+        generate_model_signing_keypair(key_dir / "model_signing_ed25519.key", key_dir / "model_signing_ed25519.pub")
+
+        # 2. Antrenam, exportam ONNX si semnam manifestul
         manifest = train_and_export_bundle(
             db_dir=db_dir,
             bundle_dir=bundle_dir,
