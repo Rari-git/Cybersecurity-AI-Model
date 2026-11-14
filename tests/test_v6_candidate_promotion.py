@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -240,6 +241,19 @@ def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_pa
     _initialize_active(model_root, private, public)
     _seed_curated_sessions(db_dir, session_count=3, events=18)
 
+    # Historical/unreviewed sessions must not be re-curated by an adaptive cycle.
+    historical = LumenStorageManager(
+        paths=DBPaths.from_dir(db_dir), enable_writers=True
+    )
+    try:
+        historical.register_baseline_session(
+            "historical-unreviewed", "baseline_lab",
+            {"events_per_sensor": 400},
+        )
+        historical.finalize_baseline_session("historical-unreviewed")
+    finally:
+        historical.close()
+
     # This host intentionally lacks the ONNX exporter package. Keep the actual
     # PyTorch training path and candidate provenance/signing/promotion real,
     # while making export a deterministic local artifact for unit testing.
@@ -275,6 +289,22 @@ def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_pa
     assert (candidate / "manifest.json").is_file()
     assert (candidate / "model_manifest.sig").is_file()
     assert resolve_active_bundle(model_root, model_root / "active_model.json") == candidate.resolve()
+
+    # The worker must leave unrelated historical curation rows untouched.
+    check = sqlite3.connect(db_dir / "telemetry_normal.db")
+    try:
+        historical_row = check.execute(
+            """SELECT approved_for_training FROM baseline_sessions
+               WHERE session_id='historical-unreviewed'"""
+        ).fetchone()
+        historical_curation = check.execute(
+            """SELECT status FROM session_curation
+               WHERE session_id='historical-unreviewed'"""
+        ).fetchone()
+        assert historical_row == (0,)
+        assert historical_curation is None
+    finally:
+        check.close()
 
 
 def test_unsigned_candidate_must_bind_disjoint_curated_sessions(tmp_path):
@@ -561,3 +591,24 @@ def test_offline_worker_can_train_and_shadow_without_signing_private_key(tmp_pat
     assert not (candidate / "model_manifest.json").exists()
     pointer = json.loads((model_root / "active_model.json").read_text())
     assert pointer["active_bundle"] == "lumen_model_bundle"
+
+def test_worker_selection_enforces_duration_without_recurating(tmp_path):
+    from training.adaptive_retrainer import _approved_session_ids
+
+    db_dir = tmp_path / "db"
+    _seed_curated_sessions(db_dir, session_count=3, events=18)
+    storage = LumenStorageManager(
+        paths=DBPaths.from_dir(db_dir), enable_writers=True
+    )
+    try:
+        eligible_without_duration_gate = _approved_session_ids(
+            storage, min_duration_sec=0, min_sensor_coverage=1.0
+        )
+        eligible_with_worker_default = _approved_session_ids(
+            storage, min_duration_sec=300, min_sensor_coverage=1.0
+        )
+        assert len(eligible_without_duration_gate) == 3
+        assert eligible_with_worker_default == []
+    finally:
+        storage.close()
+

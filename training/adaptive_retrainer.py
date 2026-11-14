@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 import uuid
@@ -22,7 +23,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from storage.telemetry_db import DBPaths, LumenStorageManager
-from training.dataset_governance import CurationDecision, curate_clean_sessions
 from training.promotion_gate import PromotionResult, evaluate_and_promote_candidate, monitor_post_promotion_rates
 from training.offline_guard import offline_network_guard
 from training.train_local_lstm import train_and_export_bundle
@@ -46,18 +46,84 @@ def _require_offline_authority() -> None:
         )
 
 
-def _approved_session_ids(storage: LumenStorageManager) -> list[str]:
+def _approved_session_ids(
+    storage: LumenStorageManager,
+    *,
+    min_duration_sec: float = 300.0,
+    min_sensor_coverage: float = 1.0,
+) -> list[str]:
+    """Select only previously curated sessions meeting this worker's policy.
+
+    This is read-only by design. The adaptive worker must not re-curate the
+    entire database on every cycle, because that would rewrite historical
+    curation decisions. Capture/operator workflows curate sessions explicitly.
+    """
+    if not math.isfinite(float(min_duration_sec)) or min_duration_sec < 0:
+        raise ValueError("min_duration_sec must be finite and non-negative")
+    if (
+        not math.isfinite(float(min_sensor_coverage))
+        or not 0.0 < min_sensor_coverage <= 1.0
+    ):
+        raise ValueError("min_sensor_coverage must be within (0, 1]")
+
     storage.flush_all()
     conn = storage.connect_readonly("normal")
     try:
         rows = conn.execute(
-            """SELECT s.session_id FROM baseline_sessions s
+            """SELECT s.session_id, c.decision_json, c.dataset_sha256
+               FROM baseline_sessions s
                JOIN session_curation c ON c.session_id=s.session_id
                WHERE s.source_type='baseline_lab' AND s.approved_for_training=1
                  AND c.status='approved_clean_baseline'
                ORDER BY s.started_at_ns ASC, s.session_id ASC"""
         ).fetchall()
-        return [str(row["session_id"]) for row in rows]
+
+        approved: list[str] = []
+        for row in rows:
+            try:
+                decision = json.loads(str(row["decision_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(decision, dict):
+                continue
+            if (
+                decision.get("approved") is not True
+                or decision.get("status") != "approved_clean_baseline"
+                or decision.get("reasons") not in ([], ())
+            ):
+                continue
+
+            duration = decision.get("duration_sec")
+            coverage = decision.get("sensor_coverage")
+            event_count = decision.get("event_count")
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not math.isfinite(float(duration))
+                or float(duration) < min_duration_sec
+            ):
+                continue
+            if (
+                isinstance(coverage, bool)
+                or not isinstance(coverage, (int, float))
+                or not math.isfinite(float(coverage))
+                or float(coverage) + 1e-12 < min_sensor_coverage
+            ):
+                continue
+            if isinstance(event_count, bool) or not isinstance(event_count, int) or event_count < 1:
+                continue
+
+            digest = row["dataset_sha256"]
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest.lower())
+                or decision.get("dataset_sha256") != digest
+            ):
+                continue
+
+            approved.append(str(row["session_id"]))
+        return approved
     finally:
         conn.close()
 
@@ -76,7 +142,11 @@ def run_adaptive_cycle(
     storage: LumenStorageManager | None = None,
     run_id: str | None = None,
 ) -> AdaptiveCycleResult:
-    """Curate, train unsigned candidate, shadow-evaluate, then conditionally promote."""
+    """Train from previously curated sessions, shadow-evaluate, then promote.
+
+    This worker does not rewrite historical curation decisions. New sessions
+    must be curated by the capture/operator workflow before training.
+    """
     _require_offline_authority()
     run_id = run_id or uuid.uuid4().hex
     if (
@@ -104,46 +174,48 @@ def run_adaptive_cycle(
     manager = storage or LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=True)
     try:
         with offline_network_guard():
-                decisions: list[CurationDecision] = curate_clean_sessions(
-                    manager,
-                    min_duration_sec=min_duration_sec,
-                    min_sensor_coverage=min_sensor_coverage,
-                )
-                rejected = tuple(item.session_id for item in decisions if not item.approved)
-                approved = _approved_session_ids(manager)
-                # Need at least one training session, one calibration/validation session,
-                # and one independent held-out clean session.
-                if len(approved) < 3:
-                    return AdaptiveCycleResult(
-                        run_id, tuple(approved), rejected, None, None, None,
-                    )
-                heldout = (approved[-1],)
-                candidate_dir = root / "candidates" / run_id
-                candidate_dir.parent.mkdir(parents=True, exist_ok=True)
-                # Never overwrite or reuse a previous candidate directory.
-                candidate_dir.mkdir(parents=False, exist_ok=False)
-                metadata = train_and_export_bundle(
-                    db_dir=db_dir,
-                    bundle_dir=candidate_dir,
-                    key_dir=keys,
-                    seq_len=seq_len,
-                    epochs=epochs,
-                    run_id=run_id,
-                    eligible_session_ids=approved,
-                    heldout_session_ids=heldout,
-                    sign_bundle=False,
-                )
-                promotion = evaluate_and_promote_candidate(
-                    candidate_dir,
-                    storage=manager,
-                    public_key_path=public_key,
-                    private_key_path=private_key if private_key.is_file() else None,
-                    model_root=root,
-                    evaluator=evaluator,
-                )
+            # Curation is performed at the capture/operator boundary. This
+            # worker consumes existing approvals only and never re-curates
+            # historical sessions on every adaptive cycle.
+            approved = _approved_session_ids(
+                manager,
+                min_duration_sec=min_duration_sec,
+                min_sensor_coverage=min_sensor_coverage,
+            )
+            rejected: tuple[str, ...] = ()
+            # Need at least one training session, one calibration/validation session,
+            # and one independent held-out clean session.
+            if len(approved) < 3:
                 return AdaptiveCycleResult(
-                    run_id, tuple(approved), rejected, str(candidate_dir), metadata, promotion,
+                    run_id, tuple(approved), rejected, None, None, None,
                 )
+            heldout = (approved[-1],)
+            candidate_dir = root / "candidates" / run_id
+            candidate_dir.parent.mkdir(parents=True, exist_ok=True)
+            # Never overwrite or reuse a previous candidate directory.
+            candidate_dir.mkdir(parents=False, exist_ok=False)
+            metadata = train_and_export_bundle(
+                db_dir=db_dir,
+                bundle_dir=candidate_dir,
+                key_dir=keys,
+                seq_len=seq_len,
+                epochs=epochs,
+                run_id=run_id,
+                eligible_session_ids=approved,
+                heldout_session_ids=heldout,
+                sign_bundle=False,
+            )
+            promotion = evaluate_and_promote_candidate(
+                candidate_dir,
+                storage=manager,
+                public_key_path=public_key,
+                private_key_path=private_key if private_key.is_file() else None,
+                model_root=root,
+                evaluator=evaluator,
+            )
+            return AdaptiveCycleResult(
+                run_id, tuple(approved), rejected, str(candidate_dir), metadata, promotion,
+            )
     finally:
         if owns_storage:
             manager.flush_all()
@@ -162,7 +234,8 @@ def run_autonomous_worker(
     """Run local training cycles and continuously monitor post-promotion rates.
 
     ``max_cycles=None`` is the autonomous service mode. The same local SQLite
-    manager is reused by curation and the rollback monitor.
+    manager is reused by training and the rollback monitor. Historical curation
+    decisions are not rewritten by this worker.
     """
     _require_offline_authority()
     if interval_sec < 1.0 or monitor_interval_sec < 1.0 or monitor_window_sec <= 0:
