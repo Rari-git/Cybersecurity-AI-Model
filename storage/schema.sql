@@ -84,6 +84,38 @@ CREATE INDEX IF NOT EXISTS idx_normal_raw_dev_topic_ts
     ON raw_events(device_id, topic, gateway_ts_ns);
 CREATE INDEX IF NOT EXISTS idx_normal_raw_session
     ON raw_events(session_id);
+
+-- Freeze approved clean-baseline telemetry and its curation evidence.
+CREATE TRIGGER IF NOT EXISTS trg_curated_raw_events_immutable_insert
+BEFORE INSERT ON raw_events
+WHEN EXISTS (SELECT 1 FROM session_curation c
+             WHERE c.session_id=NEW.session_id AND c.status='approved_clean_baseline')
+BEGIN SELECT RAISE(ABORT, 'approved clean-baseline telemetry is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_curated_raw_events_immutable_update
+BEFORE UPDATE ON raw_events
+WHEN EXISTS (SELECT 1 FROM session_curation c
+             WHERE c.session_id=OLD.session_id AND c.status='approved_clean_baseline')
+  OR EXISTS (SELECT 1 FROM session_curation c
+             WHERE c.session_id=NEW.session_id AND c.status='approved_clean_baseline')
+BEGIN SELECT RAISE(ABORT, 'approved clean-baseline telemetry is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_curated_raw_events_immutable_delete
+BEFORE DELETE ON raw_events
+WHEN EXISTS (SELECT 1 FROM session_curation c
+             WHERE c.session_id=OLD.session_id AND c.status='approved_clean_baseline')
+BEGIN SELECT RAISE(ABORT, 'approved clean-baseline telemetry is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_approved_curation_immutable_update
+BEFORE UPDATE ON session_curation
+WHEN OLD.status='approved_clean_baseline' AND NOT (
+    NEW.status IS OLD.status AND NEW.decision_json IS OLD.decision_json
+    AND NEW.dataset_sha256 IS OLD.dataset_sha256
+)
+BEGIN SELECT RAISE(ABORT, 'approved clean-baseline curation is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_approved_curation_immutable_delete
+BEFORE DELETE ON session_curation
+WHEN OLD.status='approved_clean_baseline'
+BEGIN SELECT RAISE(ABORT, 'approved clean-baseline curation is immutable'); END;
+
+
 -- Durable sensor freshness state is kept beside raw_events so freshness
 -- advancement and telemetry insertion can share one SQLite transaction.
 CREATE TABLE IF NOT EXISTS device_freshness (
@@ -163,26 +195,135 @@ CREATE TABLE IF NOT EXISTS adversarial_regression_corpus (
     indexed_at_ns INTEGER NOT NULL
 );
 
-CREATE TRIGGER IF NOT EXISTS trg_incident_to_regression_corpus
+-- Scenario execution is separate from forensic capture. A capture is eligible
+-- only after its controlled local scenario has completed successfully.
+CREATE TABLE IF NOT EXISTS regression_scenario_runs (
+    scenario_id TEXT PRIMARY KEY,
+    scenario_type TEXT NOT NULL CHECK(scenario_type IN ('protocol', 'attack', 'hardware_fault')),
+    expected_corpus_class TEXT NOT NULL CHECK(expected_corpus_class IN (
+        'adversarial', 'hardware_fault', 'protocol_violation'
+    )),
+    status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+    runner_version TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    provenance_sha256 TEXT NOT NULL CHECK(length(provenance_sha256) = 64),
+    started_at_ns INTEGER NOT NULL,
+    completed_at_ns INTEGER,
+    CHECK(
+        (scenario_type = 'protocol' AND expected_corpus_class = 'protocol_violation') OR
+        (scenario_type = 'attack' AND expected_corpus_class = 'adversarial') OR
+        (scenario_type = 'hardware_fault' AND expected_corpus_class = 'hardware_fault')
+    ),
+    CHECK(
+        (status = 'running' AND completed_at_ns IS NULL) OR
+        (status IN ('completed', 'failed') AND completed_at_ns IS NOT NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_regression_scenario_status
+    ON regression_scenario_runs(status, scenario_type);
+
+-- B5.5.6: ordinary SQL cannot rewrite/remove forensic evidence or scenario provenance.
+CREATE TRIGGER IF NOT EXISTS trg_incident_captures_immutable_update
+BEFORE UPDATE ON incident_captures
+BEGIN SELECT RAISE(ABORT, 'incident captures are immutable forensic evidence'); END;
+CREATE TRIGGER IF NOT EXISTS trg_incident_captures_immutable_delete
+BEFORE DELETE ON incident_captures
+BEGIN SELECT RAISE(ABORT, 'incident captures are immutable forensic evidence'); END;
+CREATE TRIGGER IF NOT EXISTS trg_incident_capture_after_scenario_close
+BEFORE INSERT ON incident_captures
+WHEN NEW.scenario_id IS NOT NULL AND EXISTS (
+    SELECT 1 FROM regression_scenario_runs r
+    WHERE r.scenario_id=NEW.scenario_id AND r.status<>'running'
+)
+BEGIN SELECT RAISE(ABORT, 'cannot append captures to a closed regression scenario'); END;
+CREATE TRIGGER IF NOT EXISTS trg_regression_scenario_transition_only
+BEFORE UPDATE ON regression_scenario_runs
+WHEN NOT (
+    OLD.status='running' AND NEW.status IN ('completed','failed')
+    AND OLD.completed_at_ns IS NULL AND NEW.completed_at_ns IS NOT NULL
+    AND NEW.scenario_id IS OLD.scenario_id
+    AND NEW.scenario_type IS OLD.scenario_type
+    AND NEW.expected_corpus_class IS OLD.expected_corpus_class
+    AND NEW.runner_version IS OLD.runner_version
+    AND NEW.manifest_json IS OLD.manifest_json
+    AND NEW.provenance_sha256 IS OLD.provenance_sha256
+    AND NEW.started_at_ns IS OLD.started_at_ns
+)
+BEGIN SELECT RAISE(ABORT, 'regression scenario provenance is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_regression_scenario_immutable_delete
+BEFORE DELETE ON regression_scenario_runs
+BEGIN SELECT RAISE(ABORT, 'regression scenario provenance is immutable'); END;
+
+-- Protocol classification is narrow: only deterministic freshness outcomes
+-- from the authenticated AdmissionGate path are eligible.
+CREATE TRIGGER IF NOT EXISTS trg_regression_capture_qualified
 AFTER INSERT ON incident_captures
 BEGIN
-    INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id, corpus_class, indexed_at_ns)
-    VALUES (
-        NEW.capture_id,
-        CASE
-            WHEN NEW.capture_source = 'fault_lab'
-                 OR lower(coalesce(NEW.ground_truth_label, '')) LIKE '%fault%'
-                THEN 'hardware_fault'
-            WHEN lower(NEW.reason_code) LIKE '%replay%'
-                 OR lower(NEW.reason_code) LIKE '%sequence%'
-                 OR lower(NEW.reason_code) LIKE '%freshness%'
-                 OR lower(NEW.reason_code) LIKE '%boot%'
-                 OR lower(NEW.reason_code) LIKE '%protocol%'
-                THEN 'protocol_violation'
-            ELSE 'adversarial'
-        END,
-        CAST(strftime('%s','now') AS INTEGER) * 1000000000
-    );
+    INSERT OR IGNORE INTO adversarial_regression_corpus
+        (capture_id, corpus_class, indexed_at_ns)
+    SELECT NEW.capture_id, r.expected_corpus_class,
+           CAST(strftime('%s','now') AS INTEGER) * 1000000000
+    FROM regression_scenario_runs r
+    WHERE r.scenario_id = NEW.scenario_id
+      AND r.status = 'completed'
+      AND (
+        (r.scenario_type = 'protocol'
+         AND r.expected_corpus_class = 'protocol_violation'
+         AND NEW.capture_source = 'ids_alert'
+         AND NEW.reason_code IN (
+            'REPLAY_OR_OUT_OF_ORDER_SEQUENCE',
+            'STALE_BOOT_ID',
+            'BOOT_NOT_REGISTERED',
+            'CERTIFICATE_GENERATION_MISMATCH',
+            'STALE_CERTIFICATE_GENERATION'
+         ))
+        OR
+        (r.scenario_type = 'attack'
+         AND r.expected_corpus_class = 'adversarial'
+         AND NEW.capture_source IN ('attack_lab', 'shadow_sink')
+         AND lower(trim(coalesce(NEW.ground_truth_label, ''))) = 'confirmed_attack')
+        OR
+        (r.scenario_type = 'hardware_fault'
+         AND r.expected_corpus_class = 'hardware_fault'
+         AND NEW.capture_source = 'fault_lab'
+         AND lower(trim(coalesce(NEW.ground_truth_label, ''))) = 'confirmed_hardware_fault')
+      );
+END;
+
+-- Most captures are written while the scenario is running. Qualify them only
+-- when the runner closes successfully after checking the actual DB evidence.
+CREATE TRIGGER IF NOT EXISTS trg_regression_scenario_completed
+AFTER UPDATE OF status ON regression_scenario_runs
+WHEN OLD.status = 'running' AND NEW.status = 'completed'
+BEGIN
+    INSERT OR IGNORE INTO adversarial_regression_corpus
+        (capture_id, corpus_class, indexed_at_ns)
+    SELECT c.capture_id, NEW.expected_corpus_class,
+           CAST(strftime('%s','now') AS INTEGER) * 1000000000
+    FROM incident_captures c
+    WHERE c.scenario_id = NEW.scenario_id
+      AND (
+        (NEW.scenario_type = 'protocol'
+         AND NEW.expected_corpus_class = 'protocol_violation'
+         AND c.capture_source = 'ids_alert'
+         AND c.reason_code IN (
+            'REPLAY_OR_OUT_OF_ORDER_SEQUENCE',
+            'STALE_BOOT_ID',
+            'BOOT_NOT_REGISTERED',
+            'CERTIFICATE_GENERATION_MISMATCH',
+            'STALE_CERTIFICATE_GENERATION'
+         ))
+        OR
+        (NEW.scenario_type = 'attack'
+         AND NEW.expected_corpus_class = 'adversarial'
+         AND c.capture_source IN ('attack_lab', 'shadow_sink')
+         AND lower(trim(coalesce(c.ground_truth_label, ''))) = 'confirmed_attack')
+        OR
+        (NEW.scenario_type = 'hardware_fault'
+         AND NEW.expected_corpus_class = 'hardware_fault'
+         AND c.capture_source = 'fault_lab'
+         AND lower(trim(coalesce(c.ground_truth_label, ''))) = 'confirmed_hardware_fault')
+      );
 END;
 
 -- ============================================================================

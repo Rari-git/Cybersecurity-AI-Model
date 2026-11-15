@@ -54,19 +54,16 @@ def test_unlisted_extra_artifact_is_rejected(tmp_path):
         verify_and_load_bundle(bundle, public)
 
 
-def test_promotion_and_rollback_are_atomic_pointer_updates(tmp_path):
+def test_legacy_signed_candidate_cannot_bypass_deployment_authority(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_MODEL_DEPLOYMENT_AUTHORITY", "1")
     private, public = _keys(tmp_path)
     model_root = tmp_path / "models"
-    c1 = model_root / "candidates" / "candidate-a"
-    c2 = model_root / "candidates" / "candidate-b"
-    _bundle(c1, "candidate-a", private)
-    _bundle(c2, "candidate-b", private)
+    candidate = model_root / "candidates" / "legacy-candidate"
+    _bundle(candidate, "legacy-candidate", private)
     pointer = model_root / "active_model.json"
-    first = promote_candidate(c1, public, model_root=model_root, pointer_path=pointer)
-    assert first["active_bundle"] == "candidates/candidate-a"
-    second = promote_candidate(c2, public, model_root=model_root, pointer_path=pointer)
-    assert second["previous_bundle"] == "candidates/candidate-a"
-    assert resolve_active_bundle(model_root, pointer) == c2.resolve()
-    reverted = rollback_model(model_root=model_root, pointer_path=pointer, public_key_path=public)
-    assert reverted["active_bundle"] == "candidates/candidate-a"
-    assert resolve_active_bundle(model_root, pointer) == c1.resolve()
+    with pytest.raises(PermissionError, match="approved offline signing authority"):
+        promote_candidate(
+            candidate, public, model_root=model_root, pointer_path=pointer,
+            expected_active_pointer_sha256="0" * 64,
+        )
+    assert not pointer.exists()

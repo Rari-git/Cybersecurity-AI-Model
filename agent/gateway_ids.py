@@ -457,9 +457,15 @@ class ZenohInlineGateway:
             }, separators=(",", ":")).encode("utf-8"),
         )
 
-    def _route_to_shadow_sandbox(self, device_id: str, target_topic: str, raw: bytes) -> None:
+    def _route_to_shadow_sandbox(
+        self, device_id: str, target_topic: str, raw: bytes, *,
+        scenario_id: str | None = None, ground_truth_label: str | None = None,
+    ) -> None:
         """Persist and optionally publish quarantined telemetry using real PKI metadata."""
         if not SAFE_DEVICE_ID_RE.match(device_id):
+            return
+        if not self.is_shadow_quarantined(device_id):
+            logger.error("[SHADOW SINK] refusing capture because device is not quarantined: %s", sanitize(device_id, 64))
             return
         try:
             identity = load_active_device_identity(self.cert_pointer, device_id)
@@ -485,6 +491,8 @@ class ZenohInlineGateway:
             generation=identity.generation, cert_fingerprint=identity.certificate_fingerprint,
             original_topic=target_topic, raw_payload=raw, risk_score=0.95,
             reason_code="SHADOW_QUARANTINE_ACTIVE",
+            scenario_id=scenario_id,
+            ground_truth_label=ground_truth_label,
         )
 
     def _reject_actuator(self, target: str, reason: str, raw: bytes = None) -> None:

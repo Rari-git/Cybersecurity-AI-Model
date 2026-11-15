@@ -10,7 +10,9 @@ Caracteristici:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -190,37 +192,181 @@ class _SingleWriterWorker:
             )
             return
         if self.db_path.name == "telemetry_incidents.db":
-            # Additive migration for existing incident databases.
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS adversarial_regression_corpus (
+            # Additive schema + one-time rebuild of the derived corpus index.
+            # incident_captures is immutable evidence; only its derived index is rebuilt.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS regression_scenario_runs (
+                    scenario_id TEXT PRIMARY KEY,
+                    scenario_type TEXT NOT NULL CHECK(scenario_type IN ('protocol','attack','hardware_fault')),
+                    expected_corpus_class TEXT NOT NULL CHECK(expected_corpus_class IN ('adversarial','hardware_fault','protocol_violation')),
+                    status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+                    runner_version TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    provenance_sha256 TEXT NOT NULL CHECK(length(provenance_sha256)=64),
+                    started_at_ns INTEGER NOT NULL,
+                    completed_at_ns INTEGER,
+                    CHECK((scenario_type='protocol' AND expected_corpus_class='protocol_violation') OR
+                          (scenario_type='attack' AND expected_corpus_class='adversarial') OR
+                          (scenario_type='hardware_fault' AND expected_corpus_class='hardware_fault')),
+                    CHECK((status='running' AND completed_at_ns IS NULL) OR
+                          (status IN ('completed','failed') AND completed_at_ns IS NOT NULL))
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_regression_scenario_status "
+                "ON regression_scenario_runs(status, scenario_type)"
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS adversarial_regression_corpus (
                     capture_id INTEGER PRIMARY KEY REFERENCES incident_captures(capture_id) ON DELETE CASCADE,
                     corpus_class TEXT NOT NULL CHECK(corpus_class IN ('adversarial','hardware_fault','protocol_violation')),
                     indexed_at_ns INTEGER NOT NULL
-                );
-                CREATE TRIGGER IF NOT EXISTS trg_incident_to_regression_corpus
-                AFTER INSERT ON incident_captures
-                BEGIN
-                  INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
-                  VALUES (NEW.capture_id,
-                    CASE WHEN NEW.capture_source='fault_lab' OR lower(coalesce(NEW.ground_truth_label,'')) LIKE '%fault%' THEN 'hardware_fault'
-                         WHEN lower(NEW.reason_code) LIKE '%replay%' OR lower(NEW.reason_code) LIKE '%sequence%'
-                           OR lower(NEW.reason_code) LIKE '%freshness%' OR lower(NEW.reason_code) LIKE '%boot%'
-                           OR lower(NEW.reason_code) LIKE '%protocol%' THEN 'protocol_violation'
-                         ELSE 'adversarial' END,
-                    CAST(strftime('%s','now') AS INTEGER)*1000000000);
-                END;
-                INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
-                SELECT capture_id,
-                  CASE WHEN capture_source='fault_lab' OR lower(coalesce(ground_truth_label,'')) LIKE '%fault%' THEN 'hardware_fault'
-                       WHEN lower(reason_code) LIKE '%replay%' OR lower(reason_code) LIKE '%sequence%'
-                         OR lower(reason_code) LIKE '%freshness%' OR lower(reason_code) LIKE '%boot%'
-                         OR lower(reason_code) LIKE '%protocol%' THEN 'protocol_violation'
-                       ELSE 'adversarial' END,
-                  CAST(strftime('%s','now') AS INTEGER)*1000000000
-                FROM incident_captures;
-                """
+                )"""
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(migration_id TEXT PRIMARY KEY, applied_at_ns INTEGER NOT NULL)"
+            )
+            migration_id = "regression_corpus_provenance_v1"
+            applied = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id=?", (migration_id,)
+            ).fetchone()
+            if applied is None:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for trigger_name in (
+                        "trg_incident_to_regression_corpus",
+                        "trg_regression_capture_qualified",
+                        "trg_regression_scenario_completed",
+                    ):
+                        conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                    conn.execute(
+                        """CREATE TRIGGER trg_regression_capture_qualified
+                        AFTER INSERT ON incident_captures
+                        BEGIN
+                          INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
+                          SELECT NEW.capture_id, r.expected_corpus_class, CAST(strftime('%s','now') AS INTEGER)*1000000000
+                          FROM regression_scenario_runs r
+                          WHERE r.scenario_id=NEW.scenario_id AND r.status='completed'
+                            AND (
+                              (r.scenario_type='protocol' AND r.expected_corpus_class='protocol_violation'
+                               AND NEW.capture_source='ids_alert' AND NEW.reason_code IN (
+                                 'REPLAY_OR_OUT_OF_ORDER_SEQUENCE','STALE_BOOT_ID','BOOT_NOT_REGISTERED',
+                                 'CERTIFICATE_GENERATION_MISMATCH','STALE_CERTIFICATE_GENERATION'))
+                              OR (r.scenario_type='attack' AND r.expected_corpus_class='adversarial'
+                                  AND NEW.capture_source IN ('attack_lab','shadow_sink')
+                                  AND lower(trim(coalesce(NEW.ground_truth_label,'')))='confirmed_attack')
+                              OR (r.scenario_type='hardware_fault' AND r.expected_corpus_class='hardware_fault'
+                                  AND NEW.capture_source='fault_lab'
+                                  AND lower(trim(coalesce(NEW.ground_truth_label,'')))='confirmed_hardware_fault')
+                            );
+                        END"""
+                    )
+                    conn.execute(
+                        """CREATE TRIGGER trg_regression_scenario_completed
+                        AFTER UPDATE OF status ON regression_scenario_runs
+                        WHEN OLD.status='running' AND NEW.status='completed'
+                        BEGIN
+                          INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
+                          SELECT c.capture_id, NEW.expected_corpus_class, CAST(strftime('%s','now') AS INTEGER)*1000000000
+                          FROM incident_captures c
+                          WHERE c.scenario_id=NEW.scenario_id
+                            AND (
+                              (NEW.scenario_type='protocol' AND NEW.expected_corpus_class='protocol_violation'
+                               AND c.capture_source='ids_alert' AND c.reason_code IN (
+                                 'REPLAY_OR_OUT_OF_ORDER_SEQUENCE','STALE_BOOT_ID','BOOT_NOT_REGISTERED',
+                                 'CERTIFICATE_GENERATION_MISMATCH','STALE_CERTIFICATE_GENERATION'))
+                              OR (NEW.scenario_type='attack' AND NEW.expected_corpus_class='adversarial'
+                                  AND c.capture_source IN ('attack_lab','shadow_sink')
+                                  AND lower(trim(coalesce(c.ground_truth_label,'')))='confirmed_attack')
+                              OR (NEW.scenario_type='hardware_fault' AND NEW.expected_corpus_class='hardware_fault'
+                                  AND c.capture_source='fault_lab'
+                                  AND lower(trim(coalesce(c.ground_truth_label,'')))='confirmed_hardware_fault')
+                            );
+                        END"""
+                    )
+                    conn.execute("DELETE FROM adversarial_regression_corpus")
+                    conn.execute(
+                        """INSERT OR IGNORE INTO adversarial_regression_corpus(capture_id,corpus_class,indexed_at_ns)
+                        SELECT c.capture_id, r.expected_corpus_class, CAST(strftime('%s','now') AS INTEGER)*1000000000
+                        FROM incident_captures c JOIN regression_scenario_runs r ON r.scenario_id=c.scenario_id
+                        WHERE r.status='completed' AND (
+                          (r.scenario_type='protocol' AND r.expected_corpus_class='protocol_violation'
+                           AND c.capture_source='ids_alert' AND c.reason_code IN (
+                             'REPLAY_OR_OUT_OF_ORDER_SEQUENCE','STALE_BOOT_ID','BOOT_NOT_REGISTERED',
+                             'CERTIFICATE_GENERATION_MISMATCH','STALE_CERTIFICATE_GENERATION'))
+                          OR (r.scenario_type='attack' AND r.expected_corpus_class='adversarial'
+                              AND c.capture_source IN ('attack_lab','shadow_sink')
+                              AND lower(trim(coalesce(c.ground_truth_label,'')))='confirmed_attack')
+                          OR (r.scenario_type='hardware_fault' AND r.expected_corpus_class='hardware_fault'
+                              AND c.capture_source='fault_lab'
+                              AND lower(trim(coalesce(c.ground_truth_label,'')))='confirmed_hardware_fault')
+                        )"""
+                    )
+                    conn.execute(
+                        "INSERT INTO schema_migrations(migration_id,applied_at_ns) VALUES(?,?)",
+                        (migration_id, time.time_ns()),
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+            evidence_migration = "b5_5_6_evidence_immutability_v1"
+            evidence_applied = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id=?", (evidence_migration,)
+            ).fetchone()
+            if evidence_applied is None:
+                evidence_triggers = (
+                    """CREATE TRIGGER IF NOT EXISTS trg_incident_captures_immutable_update
+                       BEFORE UPDATE ON incident_captures BEGIN
+                         SELECT RAISE(ABORT, 'incident captures are immutable forensic evidence');
+                       END""",
+                    """CREATE TRIGGER IF NOT EXISTS trg_incident_captures_immutable_delete
+                       BEFORE DELETE ON incident_captures BEGIN
+                         SELECT RAISE(ABORT, 'incident captures are immutable forensic evidence');
+                       END""",
+                    """CREATE TRIGGER IF NOT EXISTS trg_incident_capture_after_scenario_close
+                       BEFORE INSERT ON incident_captures
+                       WHEN NEW.scenario_id IS NOT NULL AND EXISTS (
+                         SELECT 1 FROM regression_scenario_runs r
+                         WHERE r.scenario_id=NEW.scenario_id AND r.status<>'running'
+                       ) BEGIN
+                         SELECT RAISE(ABORT, 'cannot append captures to a closed regression scenario');
+                       END""",
+                    """CREATE TRIGGER IF NOT EXISTS trg_regression_scenario_transition_only
+                       BEFORE UPDATE ON regression_scenario_runs
+                       WHEN NOT (
+                         OLD.status='running' AND NEW.status IN ('completed','failed')
+                         AND OLD.completed_at_ns IS NULL AND NEW.completed_at_ns IS NOT NULL
+                         AND NEW.scenario_id IS OLD.scenario_id
+                         AND NEW.scenario_type IS OLD.scenario_type
+                         AND NEW.expected_corpus_class IS OLD.expected_corpus_class
+                         AND NEW.runner_version IS OLD.runner_version
+                         AND NEW.manifest_json IS OLD.manifest_json
+                         AND NEW.provenance_sha256 IS OLD.provenance_sha256
+                         AND NEW.started_at_ns IS OLD.started_at_ns
+                       ) BEGIN
+                         SELECT RAISE(ABORT, 'regression scenario provenance is immutable');
+                       END""",
+                    """CREATE TRIGGER IF NOT EXISTS trg_regression_scenario_immutable_delete
+                       BEFORE DELETE ON regression_scenario_runs BEGIN
+                         SELECT RAISE(ABORT, 'regression scenario provenance is immutable');
+                       END""",
+                )
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in evidence_triggers:
+                        conn.execute(statement)
+                    conn.execute(
+                        "INSERT INTO schema_migrations(migration_id,applied_at_ns) VALUES(?,?)",
+                        (evidence_migration, time.time_ns()),
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
             return
         if self.db_path.name != "telemetry_normal.db":
             return
@@ -275,6 +421,44 @@ class _SingleWriterWorker:
             BEFORE UPDATE OF source_type ON baseline_sessions
             WHEN NEW.source_type='live_validated' AND NEW.approved_for_training <> 0
             BEGIN SELECT RAISE(ABORT, 'live_validated sessions cannot be approved for training'); END;
+            """
+        )
+        # Freeze approved clean-baseline evidence against ordinary SQL mutation.
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_curated_raw_events_immutable_insert
+            BEFORE INSERT ON raw_events
+            WHEN EXISTS (SELECT 1 FROM session_curation c
+                         WHERE c.session_id=NEW.session_id AND c.status='approved_clean_baseline')
+            BEGIN SELECT RAISE(ABORT, 'approved clean-baseline telemetry is immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_curated_raw_events_immutable_update
+            BEFORE UPDATE ON raw_events
+            WHEN EXISTS (SELECT 1 FROM session_curation c
+                         WHERE c.session_id=OLD.session_id AND c.status='approved_clean_baseline')
+              OR EXISTS (SELECT 1 FROM session_curation c
+                         WHERE c.session_id=NEW.session_id AND c.status='approved_clean_baseline')
+            BEGIN SELECT RAISE(ABORT, 'approved clean-baseline telemetry is immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_curated_raw_events_immutable_delete
+            BEFORE DELETE ON raw_events
+            WHEN EXISTS (SELECT 1 FROM session_curation c
+                         WHERE c.session_id=OLD.session_id AND c.status='approved_clean_baseline')
+            BEGIN SELECT RAISE(ABORT, 'approved clean-baseline telemetry is immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_approved_curation_immutable_update
+            BEFORE UPDATE ON session_curation
+            WHEN OLD.status='approved_clean_baseline' AND NOT (
+                NEW.status IS OLD.status
+                AND NEW.decision_json IS OLD.decision_json
+                AND NEW.dataset_sha256 IS OLD.dataset_sha256
+            )
+            BEGIN SELECT RAISE(ABORT, 'approved clean-baseline curation is immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_approved_curation_immutable_delete
+            BEFORE DELETE ON session_curation
+            WHEN OLD.status='approved_clean_baseline'
+            BEGIN SELECT RAISE(ABORT, 'approved clean-baseline curation is immutable'); END;
             """
         )
         # Existing V5 rows were approved by a weaker boolean-only mechanism.
@@ -533,6 +717,117 @@ class LumenStorageManager:
 
         self._writers["normal"].submit_sync(_op, timeout=10.0)
 
+    def register_regression_scenario(
+        self,
+        scenario_id: str,
+        scenario_type: str,
+        *,
+        runner_version: str,
+        manifest: dict[str, Any],
+    ) -> str:
+        """Record a local controlled scenario before its forensic actions execute.
+
+        The scenario manifest is canonically serialized and hashed. A capture is
+        not eligible for promotion evaluation until this scenario is completed.
+        """
+        expected_classes = {
+            "protocol": "protocol_violation",
+            "attack": "adversarial",
+            "hardware_fault": "hardware_fault",
+        }
+        if not isinstance(scenario_id, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", scenario_id) is None:
+            raise ValueError("scenario_id must be a safe 1-128 character identifier")
+        if scenario_type not in expected_classes:
+            raise ValueError("scenario_type must be protocol, attack, or hardware_fault")
+        if not isinstance(runner_version, str) or not runner_version.strip() or len(runner_version) > 64:
+            raise ValueError("runner_version must be a non-empty string of at most 64 characters")
+        if not isinstance(manifest, dict):
+            raise ValueError("scenario manifest must be a JSON object")
+
+        manifest_json = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        )
+        provenance_document = {
+            "scenario_id": scenario_id,
+            "scenario_type": scenario_type,
+            "runner_version": runner_version,
+            "manifest": json.loads(manifest_json),
+        }
+        canonical = json.dumps(
+            provenance_document, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        ).encode("utf-8")
+        digest = hashlib.sha256(canonical).hexdigest()
+        started_at_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """INSERT INTO regression_scenario_runs(
+                    scenario_id,scenario_type,expected_corpus_class,status,runner_version,
+                    manifest_json,provenance_sha256,started_at_ns,completed_at_ns
+                ) VALUES(?,?,?,'running',?,?,?,?,NULL)""",
+                (scenario_id, scenario_type, expected_classes[scenario_type], runner_version,
+                 manifest_json, digest, started_at_ns),
+            )
+
+        self._writers["incidents"].submit_sync(_op, timeout=10.0)
+        return digest
+
+    def complete_regression_scenario(self, scenario_id: str, *, success: bool = True) -> int:
+        """Complete a scenario once and return its qualified capture count."""
+        if not isinstance(success, bool):
+            raise ValueError("success must be boolean")
+        completed_at_ns = time.time_ns()
+
+        def _op(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                """SELECT status, scenario_type, expected_corpus_class
+                   FROM regression_scenario_runs WHERE scenario_id=?""",
+                (scenario_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown regression scenario: {scenario_id}")
+            if str(row[0]) != "running":
+                raise ValueError(f"regression scenario is not running: {scenario_id}")
+
+            qualification_sql = {
+                "protocol": (
+                    "capture_source='ids_alert' AND reason_code IN "
+                    "('REPLAY_OR_OUT_OF_ORDER_SEQUENCE','STALE_BOOT_ID','BOOT_NOT_REGISTERED',"
+                    "'CERTIFICATE_GENERATION_MISMATCH','STALE_CERTIFICATE_GENERATION')"
+                ),
+                "attack": (
+                    "capture_source IN ('attack_lab','shadow_sink') "
+                    "AND lower(trim(coalesce(ground_truth_label,'')))='confirmed_attack'"
+                ),
+                "hardware_fault": (
+                    "capture_source='fault_lab' "
+                    "AND lower(trim(coalesce(ground_truth_label,'')))='confirmed_hardware_fault'"
+                ),
+            }
+            expected_classes = {
+                "protocol": "protocol_violation",
+                "attack": "adversarial",
+                "hardware_fault": "hardware_fault",
+            }
+            count = 0
+            scenario_type = str(row[1])
+            if success and str(row[2]) == expected_classes.get(scenario_type):
+                condition = qualification_sql.get(scenario_type)
+                if condition is not None:
+                    count = int(conn.execute(
+                        f"SELECT COUNT(*) FROM incident_captures WHERE scenario_id=? AND {condition}",
+                        (scenario_id,),
+                    ).fetchone()[0])
+            final_status = "completed" if success and count > 0 else "failed"
+            # The AFTER UPDATE trigger indexes qualifying captures atomically.
+            conn.execute(
+                "UPDATE regression_scenario_runs SET status=?,completed_at_ns=? WHERE scenario_id=?",
+                (final_status, completed_at_ns, scenario_id),
+            )
+            return count if final_status == "completed" else 0
+
+        return int(self._writers["incidents"].submit_sync(_op, timeout=10.0))
+
     def load_adversarial_regression_corpus(
         self, corpus_classes: tuple[str, ...] = ("adversarial", "protocol_violation")
     ) -> list[dict[str, Any]]:
@@ -543,12 +838,69 @@ class LumenStorageManager:
         try:
             placeholders = ",".join("?" for _ in corpus_classes)
             rows = conn.execute(
-                f"""SELECT c.*, a.corpus_class FROM adversarial_regression_corpus a
+                f"""SELECT c.*, a.corpus_class,
+                           r.scenario_type, r.runner_version, r.manifest_json AS scenario_manifest_json,
+                           r.provenance_sha256
+                    FROM adversarial_regression_corpus a
                     JOIN incident_captures c ON c.capture_id=a.capture_id
-                    WHERE a.corpus_class IN ({placeholders}) ORDER BY c.capture_id""",
+                    JOIN regression_scenario_runs r ON r.scenario_id=c.scenario_id
+                    WHERE a.corpus_class IN ({placeholders}) AND r.status='completed'
+                    ORDER BY c.capture_id""",
                 tuple(corpus_classes),
             ).fetchall()
-            return [dict(row) for row in rows]
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                raw_payload = item.get("raw_payload")
+                payload_hash = item.get("payload_sha256")
+                payload_len = item.get("payload_len")
+                if not isinstance(raw_payload, (bytes, bytearray, memoryview)):
+                    raise RuntimeError(
+                        f"regression capture payload has an invalid type: {item.get('capture_id')}"
+                    )
+                raw_bytes = bytes(raw_payload)
+                if (isinstance(payload_len, bool) or not isinstance(payload_len, int)
+                        or payload_len != len(raw_bytes)):
+                    raise RuntimeError(
+                        f"regression capture payload length mismatch: {item.get('capture_id')}"
+                    )
+                if not isinstance(payload_hash, (bytes, bytearray, memoryview)) or len(payload_hash) != 32:
+                    raise RuntimeError(
+                        f"regression capture payload hash is malformed: {item.get('capture_id')}"
+                    )
+                if not hmac.compare_digest(hashlib.sha256(raw_bytes).digest(), bytes(payload_hash)):
+                    raise RuntimeError(
+                        f"regression capture payload hash mismatch: {item.get('capture_id')}"
+                    )
+                expected_classes = {
+                    "protocol": "protocol_violation",
+                    "attack": "adversarial",
+                    "hardware_fault": "hardware_fault",
+                }
+                if expected_classes.get(str(item.get("scenario_type"))) != str(item.get("corpus_class")):
+                    raise RuntimeError(
+                        f"regression capture class does not match its scenario: {item.get('capture_id')}"
+                    )
+                try:
+                    manifest = json.loads(str(item["scenario_manifest_json"]))
+                    document = {
+                        "scenario_id": str(item["scenario_id"]),
+                        "scenario_type": str(item["scenario_type"]),
+                        "runner_version": str(item["runner_version"]),
+                        "manifest": manifest,
+                    }
+                    canonical = json.dumps(
+                        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+                    ).encode("utf-8")
+                    expected = hashlib.sha256(canonical).hexdigest()
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("regression scenario provenance is malformed") from exc
+                if not hmac.compare_digest(expected, str(item["provenance_sha256"])):
+                    raise RuntimeError(
+                        f"regression scenario provenance digest mismatch: {item['scenario_id']}"
+                    )
+                result.append(item)
+            return result
         finally:
             conn.close()
 

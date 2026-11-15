@@ -551,7 +551,53 @@ def _client_processes(project_dir: Path):
     ]
 
 
+
+
+def recover_deployment_journal_or_exit() -> list[dict]:
+    """Recover an interrupted model-pointer transaction before startup preflight.
+
+    The deployment authority's opt-in flag is enabled only for this narrowly
+    scoped recovery call and is restored before any child process is launched.
+    Recovery validates the journal, pointer state, signed bundles, and
+    deployment attestation; ambiguous or corrupt states cancel startup.
+    """
+    authority_var = "LUMEN_MODEL_DEPLOYMENT_AUTHORITY"
+    previous_value = os.environ.get(authority_var)
+    os.environ[authority_var] = "1"
+    try:
+        from training.deployment_authority import recover_deployment_transactions
+
+        outcomes = recover_deployment_transactions(
+            model_root=MODEL_ROOT,
+            public_key_path=MODEL_PUBLIC_KEY,
+            pointer_path=ACTIVE_MODEL_POINTER,
+        )
+    except Exception as exc:
+        log.critical(
+            "Startup cancelled (fail-closed): deployment journal recovery failed: %s",
+            exc,
+            exc_info=True,
+        )
+        raise SystemExit(
+            "Startup cancelled (fail-closed): deployment journal recovery failed; "
+            "inspect the deployment journal and model pointers before retrying."
+        ) from exc
+    finally:
+        if previous_value is None:
+            os.environ.pop(authority_var, None)
+        else:
+            os.environ[authority_var] = previous_value
+
+    if outcomes:
+        log.warning("[MODEL DEPLOYMENT RECOVERY] reconciled transactions: %s", outcomes)
+    else:
+        log.info("[MODEL DEPLOYMENT RECOVERY] no incomplete deployment transactions")
+    return outcomes
+
+
+
 def launch_and_arrange_grid() -> int:
+    recover_deployment_journal_or_exit()
     preflight_or_exit()
     project_dir = ROOT
     (project_dir / "logs").mkdir(parents=True, exist_ok=True)

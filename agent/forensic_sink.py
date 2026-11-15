@@ -53,6 +53,8 @@ class ForensicQuarantineSink:
         reason_code: str,
         xai_json: str = "{}",
         now_mono: float | None = None,
+        scenario_id: str | None = None,
+        ground_truth_label: str | None = None,
     ) -> SinkIngestResult:
         now = time.monotonic() if now_mono is None else now_mono
 
@@ -92,8 +94,8 @@ class ForensicQuarantineSink:
                 hashlib.sha256(raw_payload).digest(),
                 raw_payload,
                 1,
-                None,
-                None,
+                ground_truth_label,
+                scenario_id,
                 retention_ns,
             )
         )

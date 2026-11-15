@@ -37,6 +37,8 @@ class ProvenanceContext:
     admission_policy_version: str = "v5.0-gate-1"
     device_id: Optional[str] = None
     generation: Optional[int] = None
+    # Trusted local scenario runner metadata; never parsed from a sensor frame.
+    scenario_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -310,7 +312,7 @@ class AdmissionGate:
                 raw_bytes,
                 1,
                 None,
-                None,
+                ctx.scenario_id,
                 retention_ns,
             )
         )

@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -16,11 +17,14 @@ from models.bundle_loader import (
     verify_and_load_bundle,
 )
 from models.model_lifecycle import resolve_active_bundle
-from storage.persistence import persist_normal_event
+from storage.persistence import persist_incident_capture, persist_normal_event
 from storage.telemetry_db import DBPaths, LumenStorageManager
 from training.adaptive_retrainer import run_adaptive_cycle
 from training.promotion_gate import (
-    evaluate_and_promote_candidate, rollback_on_rate_spike,
+    evaluate_and_promote_candidate,
+    evaluate_candidate_only,
+    verify_candidate_evaluation_report,
+    rollback_on_rate_spike,
     monitor_post_promotion_rates,
 )
 from training.dataset_governance import curate_clean_sessions
@@ -88,10 +92,19 @@ def _seed_curated_sessions(db_dir: Path, session_count=3, events=18):
     storage = LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=True)
     try:
         for session_index in range(session_count):
-            sid = f"clean-{session_index:02d}"
+            # Each invocation/session below represents a distinct independent
+            # acquisition run for the V6 adaptive train/validation/holdout split.
+            capture_run_id = uuid.uuid4().hex
+            sid = f"baseline-lab-{capture_run_id}-s01-seed{session_index}"
             storage.register_baseline_session(
                 sid, "baseline_lab",
-                {"expected_sensor_topics": [f"{DEVICE}::{TOPIC}"], "compressed_time": False},
+                {
+                    "capture_run_id": capture_run_id,
+                    "session_index": 1,
+                    "events_per_sensor": events,
+                    "expected_sensor_topics": [f"{DEVICE}::{TOPIC}"],
+                    "compressed_time": False,
+                },
             )
             base_ts = time.time_ns() + session_index * 100_000_000_000
             for index in range(events):
@@ -115,6 +128,74 @@ def _seed_curated_sessions(db_dir: Path, session_count=3, events=18):
         storage.close()
 
 
+def _seed_regression_corpus(db_dir: Path, *, scenarios_per_class: int = 2):
+    # Seed completed, provenance-verified regression scenarios in a test-only DB.
+    from storage.persistence import persist_incident_capture
+
+    storage = LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=True)
+    scenario_classes = (
+        ("adversarial", "attack", "shadow_sink", "SHADOW_QUARANTINE_ACTIVE", "confirmed_attack"),
+        ("protocol_violation", "protocol", "ids_alert", "REPLAY_OR_OUT_OF_ORDER_SEQUENCE", None),
+        ("hardware_fault", "hardware_fault", "fault_lab", "SENSOR_FROZEN", "confirmed_hardware_fault"),
+    )
+    try:
+        for corpus_class, scenario_type, capture_source, reason_code, label in scenario_classes:
+            for index in range(scenarios_per_class):
+                suffix = uuid.uuid4().hex[:16]
+                scenario_id = f"pytest-{corpus_class}-{index}-{suffix}"
+                session_id = f"pytest-live-{suffix}"
+                storage.register_baseline_session(
+                    session_id,
+                    "live_validated",
+                    {"stage_b_test_fixture": True, "scenario_id": scenario_id},
+                    approved_for_training=False,
+                )
+                storage.register_regression_scenario(
+                    scenario_id,
+                    scenario_type,
+                    runner_version="pytest-stage-b3-fixture-v1",
+                    manifest={
+                        "test_fixture": True,
+                        "corpus_class": corpus_class,
+                        "scenario_index": index,
+                        "family": f"{corpus_class}-fixture-family-{index}",
+                    },
+                )
+                raw = f"{corpus_class}-fixture-{index}".encode("ascii")
+                now_ns = time.time_ns()
+                capture = (
+                    session_id,
+                    DEVICE,
+                    f"{DEVICE}-g2-pytest",
+                    2,
+                    FP,
+                    TOPIC,
+                    f"shadow/sandbox/{DEVICE}/data",
+                    now_ns,
+                    None,
+                    capture_source,
+                    reason_code,
+                    0.95,
+                    None,
+                    len(raw),
+                    hashlib.sha256(raw).digest(),
+                    raw,
+                    1,
+                    label,
+                    scenario_id,
+                    now_ns + 14 * 24 * 3600 * 1_000_000_000,
+                )
+                persist_incident_capture(storage, capture)
+                indexed = storage.complete_regression_scenario(scenario_id, success=True)
+                if indexed < 1:
+                    raise AssertionError(
+                        f"test scenario {scenario_id} did not qualify for {corpus_class} corpus"
+                    )
+    finally:
+        storage.flush_all()
+        storage.close()
+
+
 def _unsigned_candidate(path: Path, *, validation_p95=1.0):
     path.mkdir(parents=True)
     (path / "model.onnx").write_bytes(b"candidate-onnx-test")
@@ -128,16 +209,27 @@ def _unsigned_candidate(path: Path, *, validation_p95=1.0):
         "cusum_baselines": {f"{DEVICE}::{TOPIC}": {"mean": 350, "std": 0.1}},
     }), encoding="utf-8")
     digest = hashlib.sha256(b"curated-test-session").hexdigest()
+    train_run, val_run, heldout_run = "a" * 32, "b" * 32, "c" * 32
+    train_id = f"baseline-lab-{train_run}-s01-seed1"
+    val_id = f"baseline-lab-{val_run}-s01-seed2"
+    heldout_id = f"baseline-lab-{heldout_run}-s01-seed3"
     meta = {
         "model_version": "v6-candidate-unit-test",
         "dataset_policy": "approved_clean_baseline_only",
         "offline_training": True,
+        "split_unit": "capture_run_id",
         "candidate_files_sha256": hash_unsigned_candidate_artifacts(path),
-        "train_sessions": ["train-a"],
-        "val_sessions": ["val-a"],
-        "heldout_sessions": ["holdout-a"],
-        "cusum_calibration_sessions": ["train-a"],
-        "curation_digests": {"train-a": digest, "val-a": digest, "holdout-a": digest},
+        "train_sessions": [train_id],
+        "val_sessions": [val_id],
+        "heldout_sessions": [heldout_id],
+        "cusum_calibration_sessions": [train_id],
+        "curation_digests": {train_id: digest, val_id: digest, heldout_id: digest},
+        "capture_run_ids_by_session": {
+            train_id: train_run, val_id: val_run, heldout_id: heldout_run,
+        },
+        "train_capture_runs": [train_run],
+        "val_capture_runs": [val_run],
+        "heldout_capture_runs": [heldout_run],
         "global_threshold": 1.5,
         "validation_normal_error_p95": validation_p95,
     }
@@ -176,22 +268,18 @@ def test_degraded_or_overpermissive_candidate_is_rejected_without_signing(tmp_pa
         candidate_normal_p95=2.0,
         candidate_exceedance=0.20,
     )
-    result = evaluate_and_promote_candidate(
-        candidate,
-        storage=None,
-        public_key_path=public,
-        private_key_path=private,
-        model_root=model_root,
+    result = evaluate_candidate_only(
+        candidate, storage=None, public_key_path=public, model_root=model_root,
         evaluator=lambda *_args: metrics,
     )
-    assert not result.promoted
+    assert result.evaluated
+    assert not result.all_gates_passed
     assert not all(result.gates.values())
     assert not (candidate / "model_manifest.json").exists()
-    pointer = json.loads((model_root / "active_model.json").read_text())
+    pointer = json.loads((model_root / "active_model.json").read_text(encoding="utf-8"))
     assert pointer["active_bundle"] == "lumen_model_bundle"
 
-
-def test_valid_candidate_is_signed_promoted_and_automatically_rolled_back(tmp_path):
+def test_valid_candidate_is_evaluated_without_signing_or_deployment(tmp_path):
     model_root = tmp_path / "models"
     key_dir = tmp_path / "keys"
     key_dir.mkdir()
@@ -199,36 +287,162 @@ def test_valid_candidate_is_signed_promoted_and_automatically_rolled_back(tmp_pa
     _initialize_active(model_root, private, public)
     candidate = model_root / "candidates" / "improved"
     _unsigned_candidate(candidate)
-    result = evaluate_and_promote_candidate(
-        candidate,
-        storage=None,
-        public_key_path=public,
-        private_key_path=private,
-        model_root=model_root,
+    result = evaluate_candidate_only(
+        candidate, storage=None, public_key_path=public, model_root=model_root,
         evaluator=lambda *_args: _metric_pair(),
     )
-    assert result.promoted and all(result.gates.values())
-    verified = verify_and_load_bundle(candidate, public)
-    assert verified.manifest["signed_by_authority"] == "local_offline_ed25519"
-    active_pointer = json.loads((model_root / "active_model.json").read_text())
-    previous_pointer = json.loads((model_root / "previous_model.json").read_text())
-    assert active_pointer["active_bundle"] == "candidates/improved"
-    assert previous_pointer["active_bundle"] == "lumen_model_bundle"
-    assert resolve_active_bundle(model_root, model_root / "active_model.json") == candidate.resolve()
-
-    rollback = rollback_on_rate_spike(
-        {"anomaly_rate": 0.30, "fault_rate": 0.10},
-        {"anomaly_rate": 0.05, "fault_rate": 0.0},
-        model_root=model_root,
-        public_key_path=public,
-        anomaly_rate_margin=0.05,
-        fault_rate_margin=0.0,
-    )
-    assert rollback is not None and rollback["rollback"] is True
+    assert result.evaluated and result.all_gates_passed
+    assert result.report_path and Path(result.report_path).is_file()
+    assert not (candidate / "model_manifest.json").exists()
+    active_pointer = json.loads((model_root / "active_model.json").read_text(encoding="utf-8"))
+    assert active_pointer["active_bundle"] == "lumen_model_bundle"
+    assert not (model_root / "previous_model.json").exists()
     assert resolve_active_bundle(model_root, model_root / "active_model.json") == (model_root / "lumen_model_bundle").resolve()
 
+def _candidate_evaluation_fixture(tmp_path):
+    model_root = tmp_path / "models"
+    key_dir = tmp_path / "keys"
+    model_root.mkdir()
+    key_dir.mkdir()
+    private, public = _keypair(key_dir)
+    _initialize_active(model_root, private, public)
+    candidate_dir = model_root / "candidates" / "b5-2-candidate"
+    candidate_dir.parent.mkdir(parents=True)
+    _unsigned_candidate(candidate_dir)
+    result = evaluate_candidate_only(
+        candidate_dir,
+        storage=None,
+        public_key_path=public,
+        model_root=model_root,
+        evaluator=lambda _candidate, _active, _manifest: _metric_pair(),
+    )
+    return model_root, public, candidate_dir, result
 
-def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_path, monkeypatch):
+
+def test_candidate_evaluation_report_binds_candidate_and_active_snapshots(tmp_path):
+    model_root, public, candidate_dir, result = _candidate_evaluation_fixture(tmp_path)
+
+    assert result.evaluated is True
+    assert result.all_gates_passed is True
+    assert result.report_id
+    assert result.report_sha256
+    assert Path(result.report_path).parent == model_root / "evaluations"
+
+    report = verify_candidate_evaluation_report(
+        result.report_path,
+        model_root=model_root,
+        public_key_path=public,
+        candidate_dir=candidate_dir,
+    )
+    assert report["report_id"] == result.report_id
+    assert report["report_sha256"] == result.report_sha256
+    assert report["candidate"]["manifest_sha256"] == result.candidate_manifest_sha256
+    assert report["candidate"]["artifacts_sha256"]["model.onnx"]
+    assert report["active"]["manifest_sha256"] == result.active_manifest_sha256
+    assert report["active"]["signature_sha256"]
+    assert report["active"]["pointer_sha256"]
+    assert report["data_provenance"]["split_unit"] == "capture_run_id"
+    assert len(report["data_provenance"]["train_capture_runs"]) == 1
+    assert len(report["data_provenance"]["validation_capture_runs"]) == 1
+    assert len(report["data_provenance"]["heldout_capture_runs"]) == 1
+    assert report["evaluation"]["all_gates_passed"] is True
+    assert not (candidate_dir / "model_manifest.sig").exists()
+
+
+def test_candidate_evaluation_report_rejects_report_tampering(tmp_path):
+    model_root, public, candidate_dir, result = _candidate_evaluation_fixture(tmp_path)
+    report_path = Path(result.report_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["evaluation"]["reason"] = "FORGED_APPROVAL"
+    report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="evaluation report SHA-256 mismatch"):
+        verify_candidate_evaluation_report(
+            report_path, model_root=model_root, public_key_path=public,
+            candidate_dir=candidate_dir,
+        )
+
+
+def test_candidate_evaluation_report_rejects_candidate_changed_after_evaluation(tmp_path):
+    model_root, public, candidate_dir, result = _candidate_evaluation_fixture(tmp_path)
+    (candidate_dir / "model.onnx").write_bytes(b"changed-after-evaluation")
+
+    with pytest.raises(ValueError, match="candidate SHA-256 mismatch"):
+        verify_candidate_evaluation_report(
+            result.report_path, model_root=model_root, public_key_path=public,
+            candidate_dir=candidate_dir,
+        )
+
+
+def test_candidate_evaluation_report_rejects_active_pointer_changed_after_evaluation(tmp_path):
+    model_root, public, _candidate_dir, result = _candidate_evaluation_fixture(tmp_path)
+    pointer_path = model_root / "active_model.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["promoted_at_unix_ns"] += 1
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="active model or pointer snapshot"):
+        verify_candidate_evaluation_report(
+            result.report_path, model_root=model_root, public_key_path=public,
+        )
+
+
+def test_candidate_mutation_during_evaluation_prevents_report_creation(tmp_path):
+    model_root = tmp_path / "models"
+    key_dir = tmp_path / "keys"
+    model_root.mkdir()
+    key_dir.mkdir()
+    private, public = _keypair(key_dir)
+    _initialize_active(model_root, private, public)
+    candidate_dir = model_root / "candidates" / "mutated-during-evaluation"
+    candidate_dir.parent.mkdir(parents=True)
+    _unsigned_candidate(candidate_dir)
+
+    def mutating_evaluator(candidate, _active, _manifest):
+        (Path(candidate) / "model.onnx").write_bytes(b"mutated-in-evaluator")
+        return _metric_pair()
+
+    with pytest.raises(ValueError, match="candidate SHA-256 mismatch"):
+        evaluate_candidate_only(
+            candidate_dir,
+            storage=None,
+            public_key_path=public,
+            model_root=model_root,
+            evaluator=mutating_evaluator,
+        )
+    assert not (model_root / "evaluations").exists()
+
+
+def test_active_pointer_mutation_during_evaluation_prevents_report_creation(tmp_path):
+    model_root = tmp_path / "models"
+    key_dir = tmp_path / "keys"
+    model_root.mkdir()
+    key_dir.mkdir()
+    private, public = _keypair(key_dir)
+    _initialize_active(model_root, private, public)
+    candidate_dir = model_root / "candidates" / "active-mutated-during-evaluation"
+    candidate_dir.parent.mkdir(parents=True)
+    _unsigned_candidate(candidate_dir)
+
+    def mutating_evaluator(_candidate, _active, _manifest):
+        pointer_path = model_root / "active_model.json"
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        pointer["promoted_at_unix_ns"] += 1
+        pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+        return _metric_pair()
+
+    with pytest.raises(RuntimeError, match="active model or pointer changed during shadow evaluation"):
+        evaluate_candidate_only(
+            candidate_dir,
+            storage=None,
+            public_key_path=public,
+            model_root=model_root,
+            evaluator=mutating_evaluator,
+        )
+    assert not (model_root / "evaluations").exists()
+
+
+def test_offline_worker_trains_and_evaluates_unsigned_candidate_without_deploying(tmp_path, monkeypatch):
     import sys
     import torch
     import training.adaptive_retrainer as adaptive
@@ -240,6 +454,7 @@ def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_pa
     private, public = _keypair(key_dir)
     _initialize_active(model_root, private, public)
     _seed_curated_sessions(db_dir, session_count=3, events=18)
+    _seed_regression_corpus(db_dir)
 
     # Historical/unreviewed sessions must not be re-curated by an adaptive cycle.
     historical = LumenStorageManager(
@@ -255,7 +470,7 @@ def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_pa
         historical.close()
 
     # This host intentionally lacks the ONNX exporter package. Keep the actual
-    # PyTorch training path and candidate provenance/signing/promotion real,
+    # PyTorch training path and candidate provenance/shadow evaluation real,
     # while making export a deterministic local artifact for unit testing.
     def fake_onnx_export(_model, _input, output_path, **_kwargs):
         Path(output_path).write_bytes(b"test-double-onnx-artifact")
@@ -270,7 +485,6 @@ def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_pa
     result = adaptive.run_adaptive_cycle(
         db_dir=db_dir,
         model_root=model_root,
-        key_dir=key_dir,
         public_key_path=public,
         min_duration_sec=0,
         min_sensor_coverage=1.0,
@@ -283,12 +497,17 @@ def test_offline_worker_trains_unsigned_candidate_then_signs_and_promotes(tmp_pa
     assert result.candidate_dir
     assert result.training_metadata["offline_training"] is True
     assert result.training_metadata["signed"] is False
-    assert result.promotion and result.promotion.promoted
+    assert result.evaluation is not None
+    assert result.evaluation.evaluated is True
+    assert result.evaluation.all_gates_passed is True
+    assert result.evaluation.reason == "ALL_EVALUATION_GATES_PASSED"
     candidate = Path(result.candidate_dir)
     assert (candidate / "model.onnx").is_file()
     assert (candidate / "manifest.json").is_file()
-    assert (candidate / "model_manifest.sig").is_file()
-    assert resolve_active_bundle(model_root, model_root / "active_model.json") == candidate.resolve()
+    assert not (candidate / "model_manifest.sig").exists()
+    assert resolve_active_bundle(model_root, model_root / "active_model.json") == (
+        model_root / "lumen_model_bundle"
+    ).resolve()
 
     # The worker must leave unrelated historical curation rows untouched.
     check = sqlite3.connect(db_dir / "telemetry_normal.db")
@@ -390,8 +609,12 @@ def test_shadow_evaluator_protocol_capture_is_immediate_and_not_scored_by_lstm(t
     ))
     group = gate.EvaluationGroup("protocol:replay", "protocol", DEVICE, TOPIC, tuple())
     result = gate._score_bundle(tmp_path, tmp_path / "public.pem", [group])
-    assert result["attack_total"] == 1
-    assert result["attack_detected"] == 1
+    assert result["attack_total"] == 0
+    assert result["attack_detected"] == 0
+    assert result["attack_recall"] == 0.0
+    assert result["protocol_total"] == 1
+    assert result["protocol_detected"] == 1
+    assert result["protocol_recall"] == 1.0
     assert result["detections"]["protocol:replay"] == {
         "detected": True, "latency": 1, "source": "protocol",
     }
@@ -410,70 +633,50 @@ def test_process_offline_guard_blocks_network_and_restores_socket_apis():
     assert callable(socket.create_connection)
 
 
-def test_post_promotion_rate_monitor_automatically_rolls_back(tmp_path, monkeypatch):
-    import training.promotion_gate as gate
+def test_legacy_post_promotion_rate_monitor_is_disabled(tmp_path):
+    with pytest.raises(PermissionError, match="legacy deployment monitor is disabled"):
+        monitor_post_promotion_rates(
+            storage=object(), model_root=tmp_path / "models",
+            public_key_path=tmp_path / "model_signing_ed25519.pub",
+        )
 
-    model_root = tmp_path / "models"
-    key_dir = tmp_path / "keys"
-    key_dir.mkdir()
-    private, public = _keypair(key_dir)
-    _initialize_active(model_root, private, public)
-    candidate = model_root / "candidates" / "rate-monitored"
-    _unsigned_candidate(candidate)
-    promoted = evaluate_and_promote_candidate(
-        candidate, storage=None, public_key_path=public, private_key_path=private,
-        model_root=model_root, evaluator=lambda *_args: _metric_pair(),
-    )
-    assert promoted.promoted
-
-    monkeypatch.setattr(gate, "read_post_promotion_rates", lambda *_args, **_kwargs: {
-        "anomaly_rate": 0.25, "fault_rate": 0.02, "event_count": 100.0,
-    })
-    result = monitor_post_promotion_rates(
-        storage=object(), model_root=model_root, public_key_path=public,
-        anomaly_rate_margin=0.01, fault_rate_margin=0.01,
-    )
-    assert result and result["rollback"] is True
-    assert resolve_active_bundle(model_root, model_root / "active_model.json") == (model_root / "lumen_model_bundle").resolve()
-
-
-def test_autonomous_worker_runs_scheduled_cycles_and_monitors_between_them(tmp_path, monkeypatch):
+def test_autonomous_worker_runs_evaluation_cycles_without_deployment_monitoring(tmp_path, monkeypatch):
     from types import SimpleNamespace
     import training.adaptive_retrainer as adaptive
 
     monkeypatch.setenv("LUMEN_ADAPTIVE_OFFLINE", "1")
     clock = [0.0]
-    monkeypatch.setattr(adaptive.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(adaptive.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(
+        adaptive.time, "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
     cycles = []
-    monitors = []
 
     def fake_cycle(*, storage, **_kwargs):
         cycles.append(storage)
         return SimpleNamespace(
-            run_id=f"run-{len(cycles)}", curated_sessions=("clean",),
-            rejected_sessions=(), candidate_dir=None, promotion=None,
+            run_id=f"run-{len(cycles)}",
+            curated_sessions=("clean",),
+            rejected_sessions=(),
+            candidate_dir=None,
+            evaluation=None,
+            preflight_reason="INSUFFICIENT_CURATED_SESSIONS",
+            preflight_details=None,
         )
-
-    def fake_monitor(storage, **_kwargs):
-        monitors.append(storage)
-        return {"rollback": False}
 
     sentinel_storage = object()
     monkeypatch.setattr(adaptive, "run_adaptive_cycle", fake_cycle)
-    monkeypatch.setattr(adaptive, "monitor_post_promotion_rates", fake_monitor)
+    assert not hasattr(adaptive, "monitor_post_promotion_rates")
     results = adaptive.run_autonomous_worker(
         storage=sentinel_storage,
         db_dir=tmp_path / "db",
         model_root=tmp_path / "models",
-        key_dir=tmp_path / "keys",
         interval_sec=1.0,
-        monitor_interval_sec=1.0,
         max_cycles=2,
     )
     assert len(results) == 2
     assert cycles == [sentinel_storage, sentinel_storage]
-    assert monitors == [sentinel_storage]
+    assert clock[0] == 1.0
 
 
 def test_recent_post_promotion_rates_are_read_from_local_sqlite(tmp_path):
@@ -560,6 +763,7 @@ def test_offline_worker_can_train_and_shadow_without_signing_private_key(tmp_pat
     public = runtime_keys / "model_signing_ed25519.pub"
     shutil.copyfile(bootstrap_public, public)
     _seed_curated_sessions(db_dir, session_count=3, events=18)
+    _seed_regression_corpus(db_dir)
 
     def fake_onnx_export(_model, _input, output_path, **_kwargs):
         Path(output_path).write_bytes(b"test-double-onnx-artifact")
@@ -571,7 +775,6 @@ def test_offline_worker_can_train_and_shadow_without_signing_private_key(tmp_pat
     result = adaptive.run_adaptive_cycle(
         db_dir=db_dir,
         model_root=model_root,
-        key_dir=runtime_keys,
         public_key_path=public,
         min_duration_sec=0,
         min_sensor_coverage=1.0,
@@ -583,11 +786,13 @@ def test_offline_worker_can_train_and_shadow_without_signing_private_key(tmp_pat
 
     assert result.candidate_dir
     assert result.training_metadata["signed"] is False
-    assert result.promotion is not None
-    assert not result.promotion.promoted
-    assert result.promotion.reason == "OFFLINE_SIGNING_KEY_UNAVAILABLE"
+    assert result.evaluation is not None
+    assert result.evaluation.evaluated is True
+    assert result.evaluation.all_gates_passed is True
+    assert result.evaluation.reason == "ALL_EVALUATION_GATES_PASSED"
     candidate = Path(result.candidate_dir)
     assert (candidate / "manifest.json").is_file()
+    assert not (candidate / "model_manifest.sig").exists()
     assert not (candidate / "model_manifest.json").exists()
     pointer = json.loads((model_root / "active_model.json").read_text())
     assert pointer["active_bundle"] == "lumen_model_bundle"
@@ -612,3 +817,29 @@ def test_worker_selection_enforces_duration_without_recurating(tmp_path):
     finally:
         storage.close()
 
+
+
+def test_protocol_detection_regression_is_a_separate_promotion_gate():
+    from training.promotion_gate import _promotion_gates
+
+    metrics = {
+        "candidate": {
+            "attack_recall": 0.9,
+            "attack_latency": {},
+            "protocol_recall": 0.5,
+            "false_fault_quarantines": 0,
+            "normal_error_p95": 0.5,
+            "normal_threshold_exceedance_rate": 0.01,
+        },
+        "active": {
+            "attack_recall": 0.8,
+            "attack_latency": {},
+            "protocol_recall": 1.0,
+            "false_fault_quarantines": 0,
+            "normal_error_p95": 0.6,
+            "normal_threshold_exceedance_rate": 0.02,
+        },
+    }
+    gates = _promotion_gates(metrics, {"validation_normal_error_p95": 1.0})
+    assert gates["attack_recall_not_worse_than_active"] is True
+    assert gates["protocol_detection_not_worse_than_active"] is False

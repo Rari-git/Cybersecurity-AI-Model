@@ -182,6 +182,184 @@ def _extract_windows_by_session(
         ro.close()
 
 
+def load_capture_run_ids(
+    db_dir: str | Path,
+    session_ids: list[str] | tuple[str, ...],
+) -> dict[str, str]:
+    """Load and validate the capture_run_id provenance for approved sessions.
+
+    A capture run is the independent acquisition unit. A session ID alone is
+    not sufficient evidence of independence because one capture invocation can
+    create several sessions.
+    """
+    ids = tuple(dict.fromkeys(str(value) for value in session_ids))
+    if not ids or any(not value for value in ids):
+        raise ValueError("capture-run provenance requires non-empty session IDs")
+    storage = LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=False)
+    conn = storage.connect_readonly("normal")
+    try:
+        rows = []
+        for offset in range(0, len(ids), 500):
+            batch = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(conn.execute(
+                f"""SELECT s.session_id, s.source_type, s.approved_for_training,
+                           s.config_json, c.status
+                    FROM baseline_sessions s
+                    JOIN session_curation c ON c.session_id=s.session_id
+                    WHERE s.session_id IN ({placeholders})""",
+                batch,
+            ).fetchall())
+        if {str(row["session_id"]) for row in rows} != set(ids):
+            raise ValueError("one or more sessions are missing approved capture-run provenance")
+
+        result: dict[str, str] = {}
+        for row in rows:
+            session_id = str(row["session_id"])
+            if (
+                str(row["source_type"]) != "baseline_lab"
+                or int(row["approved_for_training"]) != 1
+                or str(row["status"]) != "approved_clean_baseline"
+            ):
+                raise ValueError(f"session {session_id} is not an approved clean baseline")
+            try:
+                config = json.loads(str(row["config_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"session {session_id} has invalid capture configuration") from exc
+            if not isinstance(config, dict):
+                raise ValueError(f"session {session_id} capture configuration must be an object")
+            capture_run_id = config.get("capture_run_id")
+            if (
+                not isinstance(capture_run_id, str)
+                or len(capture_run_id) != 32
+                or capture_run_id != capture_run_id.lower()
+                or any(ch not in "0123456789abcdef" for ch in capture_run_id)
+                or not session_id.startswith(f"baseline-lab-{capture_run_id}-")
+            ):
+                raise ValueError(
+                    f"session {session_id} has missing or invalid capture_run_id provenance"
+                )
+            result[session_id] = capture_run_id
+        return result
+    finally:
+        conn.close()
+        storage.close()
+
+
+def build_capture_run_split(
+    db_dir: str | Path,
+    session_ids: list[str] | tuple[str, ...],
+    *,
+    storage: LumenStorageManager | None = None,
+) -> dict[str, tuple[str, ...] | dict[str, str]] | None:
+    """Build a deterministic train/validation/holdout split by capture run.
+
+    All sessions produced by one capture invocation remain in exactly one
+    partition. The oldest run(s) train, the penultimate independent run
+    validates/calibrates, and the newest independent run is held out. Returns
+    None until at least three distinct, approved capture runs exist.
+    """
+    ids = tuple(dict.fromkeys(str(value) for value in session_ids))
+    if not ids or any(not value for value in ids):
+        raise ValueError("capture-run split requires non-empty session IDs")
+    owns_storage = storage is None
+    manager = storage or LumenStorageManager(
+        paths=DBPaths.from_dir(db_dir), enable_writers=False
+    )
+    try:
+        manager.flush_all()
+        conn = manager.connect_readonly("normal")
+        try:
+            rows = []
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(conn.execute(
+                    f"""SELECT s.session_id, s.started_at_ns, s.source_type,
+                               s.approved_for_training, s.config_json, c.status
+                        FROM baseline_sessions s
+                        JOIN session_curation c ON c.session_id=s.session_id
+                        WHERE s.session_id IN ({placeholders})""",
+                    batch,
+                ).fetchall())
+        finally:
+            conn.close()
+    finally:
+        if owns_storage:
+            manager.close()
+
+    if {str(row["session_id"]) for row in rows} != set(ids):
+        raise ValueError("one or more sessions are missing approved capture-run provenance")
+
+    groups: dict[str, dict[str, object]] = {}
+    capture_run_ids_by_session: dict[str, str] = {}
+    for row in rows:
+        session_id = str(row["session_id"])
+        if (
+            str(row["source_type"]) != "baseline_lab"
+            or int(row["approved_for_training"]) != 1
+            or str(row["status"]) != "approved_clean_baseline"
+        ):
+            raise ValueError(f"session {session_id} is not an approved clean baseline")
+        try:
+            config = json.loads(str(row["config_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"session {session_id} has invalid capture configuration") from exc
+        if not isinstance(config, dict):
+            raise ValueError(f"session {session_id} capture configuration must be an object")
+        capture_run_id = config.get("capture_run_id")
+        if (
+            not isinstance(capture_run_id, str)
+            or len(capture_run_id) != 32
+            or capture_run_id != capture_run_id.lower()
+            or any(ch not in "0123456789abcdef" for ch in capture_run_id)
+            or not session_id.startswith(f"baseline-lab-{capture_run_id}-")
+        ):
+            raise ValueError(
+                f"session {session_id} has missing or invalid capture_run_id provenance"
+            )
+        try:
+            started_at_ns = int(row["started_at_ns"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"session {session_id} has an invalid start timestamp") from exc
+        group = groups.setdefault(
+            capture_run_id,
+            {"first_started_at_ns": started_at_ns, "sessions": []},
+        )
+        group["first_started_at_ns"] = min(
+            int(group["first_started_at_ns"]), started_at_ns
+        )
+        group["sessions"].append((started_at_ns, session_id))
+        capture_run_ids_by_session[session_id] = capture_run_id
+
+    ordered_runs = sorted(
+        groups.items(),
+        key=lambda item: (int(item[1]["first_started_at_ns"]), item[0]),
+    )
+    if len(ordered_runs) < 3:
+        return None
+
+    def sessions_for(run_items):
+        return tuple(
+            session_id
+            for _run_id, group in run_items
+            for _started_at_ns, session_id in sorted(group["sessions"])
+        )
+
+    train_runs = ordered_runs[:-2]
+    validation_runs = ordered_runs[-2:-1]
+    heldout_runs = ordered_runs[-1:]
+    return {
+        "train_session_ids": sessions_for(train_runs),
+        "validation_session_ids": sessions_for(validation_runs),
+        "heldout_session_ids": sessions_for(heldout_runs),
+        "train_capture_run_ids": tuple(run_id for run_id, _group in train_runs),
+        "validation_capture_run_ids": tuple(run_id for run_id, _group in validation_runs),
+        "heldout_capture_run_ids": tuple(run_id for run_id, _group in heldout_runs),
+        "capture_run_ids_by_session": capture_run_ids_by_session,
+    }
+
+
 def _load_curation_digests(db_dir: str | Path, session_ids: list[str] | tuple[str, ...]) -> dict[str, str]:
     """Return immutable curation digests for the exact sessions in a candidate."""
     storage = LumenStorageManager(paths=DBPaths.from_dir(db_dir), enable_writers=False)
@@ -241,8 +419,14 @@ def train_and_export_bundle(
     eligible_session_ids: list[str] | tuple[str, ...] | None = None,
     heldout_session_ids: list[str] | tuple[str, ...] = (),
     sign_bundle: bool = True,
+    validation_session_ids: list[str] | tuple[str, ...] | None = None,
+    require_independent_capture_runs: bool | None = None,
 ) -> dict:
     run_id = run_id or uuid.uuid4().hex
+    if require_independent_capture_runs is None:
+        # Unsigned bundles belong to the V6 offline authority and must use
+        # independent capture runs. Legacy signed E5 calls retain their API.
+        require_independent_capture_runs = not sign_bundle
     if bundle_dir is None:
         bundle_dir = Path("models") / "candidates" / run_id
     torch.manual_seed(seed)
@@ -252,15 +436,75 @@ def train_and_export_bundle(
         db_dir, seq_len=seq_len, eligible_session_ids=eligible_session_ids
     )
     session_ids = list(windows_by_session.keys())
-    heldout_sessions = list(dict.fromkeys(str(value) for value in heldout_session_ids))
+    heldout_input = [str(value) for value in heldout_session_ids]
+    if len(set(heldout_input)) != len(heldout_input):
+        raise ValueError("held-out session IDs must be unique")
+    heldout_sessions = heldout_input
     missing_holdout = sorted(set(heldout_sessions) - set(session_ids))
     if missing_holdout:
         raise ValueError(f"held-out sessions are not curated approved baseline sessions: {missing_holdout}")
-    fit_sessions = [sid for sid in session_ids if sid not in set(heldout_sessions)]
-    if len(fit_sessions) < 2:
-        raise RuntimeError("Need at least 2 non-heldout curated sessions for training/calibration.")
-    train_sessions = fit_sessions[:-1]
-    val_sessions = [fit_sessions[-1]]
+
+    capture_run_ids_by_session: dict[str, str] = {}
+    train_capture_runs: list[str] = []
+    val_capture_runs: list[str] = []
+    heldout_capture_runs: list[str] = []
+    if require_independent_capture_runs:
+        if eligible_session_ids is None:
+            raise ValueError("V6 capture-run splitting requires explicit eligible_session_ids")
+        if validation_session_ids is None:
+            raise ValueError("V6 capture-run splitting requires explicit validation_session_ids")
+        validation_input = [str(value) for value in validation_session_ids]
+        if len(set(validation_input)) != len(validation_input):
+            raise ValueError("validation session IDs must be unique")
+        if not validation_input or not heldout_sessions:
+            raise RuntimeError("V6 candidate requires independent validation and held-out capture runs")
+        if set(validation_input) & set(heldout_sessions):
+            raise ValueError("validation and held-out sessions must be disjoint")
+        missing_validation = sorted(set(validation_input) - set(session_ids))
+        if missing_validation:
+            raise ValueError(
+                f"validation sessions are not curated approved baseline sessions: {missing_validation}"
+            )
+        excluded = set(validation_input) | set(heldout_sessions)
+        train_sessions = [sid for sid in session_ids if sid not in excluded]
+        val_sessions = validation_input
+        if not train_sessions:
+            raise RuntimeError("V6 candidate requires at least one training capture run")
+        capture_run_ids_by_session = load_capture_run_ids(db_dir, session_ids)
+        train_capture_runs = sorted({capture_run_ids_by_session[sid] for sid in train_sessions})
+        val_capture_runs = sorted({capture_run_ids_by_session[sid] for sid in val_sessions})
+        heldout_capture_runs = sorted({capture_run_ids_by_session[sid] for sid in heldout_sessions})
+        if not train_capture_runs or not val_capture_runs or not heldout_capture_runs:
+            raise RuntimeError("training, validation and held-out partitions must each contain a capture run")
+        if (
+            set(train_capture_runs) & set(val_capture_runs)
+            or set(train_capture_runs) & set(heldout_capture_runs)
+            or set(val_capture_runs) & set(heldout_capture_runs)
+        ):
+            raise ValueError(
+                "capture_run_id leakage: one acquisition run appears in multiple data partitions"
+            )
+    else:
+        fit_sessions = [sid for sid in session_ids if sid not in set(heldout_sessions)]
+        if len(fit_sessions) < 2:
+            raise RuntimeError("Need at least 2 non-heldout curated sessions for training/calibration.")
+        if validation_session_ids is None:
+            train_sessions = fit_sessions[:-1]
+            val_sessions = [fit_sessions[-1]]
+        else:
+            val_sessions = [str(value) for value in validation_session_ids]
+            if not val_sessions or len(set(val_sessions)) != len(val_sessions):
+                raise ValueError("validation session IDs must be non-empty and unique")
+            if set(val_sessions) & set(heldout_sessions):
+                raise ValueError("validation and held-out sessions must be disjoint")
+            missing_validation = sorted(set(val_sessions) - set(session_ids))
+            if missing_validation:
+                raise ValueError(
+                    f"validation sessions are not curated approved baseline sessions: {missing_validation}"
+                )
+            train_sessions = [sid for sid in fit_sessions if sid not in set(val_sessions)]
+            if not train_sessions:
+                raise RuntimeError("Need at least one training session separate from validation/holdout.")
 
     train_items = [item for sid in train_sessions for item in windows_by_session[sid]]
     val_items = [item for sid in val_sessions for item in windows_by_session[sid]]
@@ -410,6 +654,14 @@ def train_and_export_bundle(
         "candidate_files_sha256": candidate_files_sha256,
         "curation_digests": curation_digests,
     }
+    if require_independent_capture_runs:
+        metadata.update({
+            "split_unit": "capture_run_id",
+            "capture_run_ids_by_session": capture_run_ids_by_session,
+            "train_capture_runs": train_capture_runs,
+            "val_capture_runs": val_capture_runs,
+            "heldout_capture_runs": heldout_capture_runs,
+        })
     (bdir / "manifest.json").write_text(
         json.dumps(metadata, sort_keys=True, indent=2, allow_nan=False),
         encoding="utf-8",

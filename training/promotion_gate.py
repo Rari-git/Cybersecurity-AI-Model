@@ -7,18 +7,24 @@ account with access to the model-signing private key.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 import numpy as np
 
 from models.bundle_loader import (
+    _is_symlink_or_reparse,
+    hash_unsigned_candidate_artifacts,
     load_unsigned_candidate_for_evaluation,
+    sha256_file,
     sign_model_bundle,
     validate_unsigned_candidate_bundle,
     verify_and_load_bundle,
@@ -46,6 +52,25 @@ class PromotionResult:
     active_pointer: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class CandidateEvaluationResult:
+    # Quality-gate result only; this object grants no signing/deployment authority.
+    evaluated: bool
+    candidate_dir: str
+    active_bundle: str
+    gates: dict[str, bool]
+    metrics: dict[str, Any]
+    all_gates_passed: bool
+    reason: str
+    report_id: str
+    report_path: str
+    report_sha256: str
+    candidate_manifest_sha256: str
+    active_manifest_sha256: str
+    audit_status: str = "written"
+    audit_warning: str | None = None
+
+
 def _finite_number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise ValueError(f"evaluation metric {field} must be a finite number")
@@ -59,31 +84,29 @@ def _event_group_key(row: dict[str, Any], default_category: str) -> tuple[str, s
     return scenario, device, topic
 
 
-def _load_clean_groups(storage: LumenStorageManager, session_ids: Iterable[str]) -> list[EvaluationGroup]:
-    ids = tuple(dict.fromkeys(str(value) for value in session_ids))
-    if not ids:
-        return []
-    conn = storage.connect_readonly("normal")
-    try:
-        placeholders = ",".join("?" for _ in ids)
-        rows = conn.execute(
-            f"""SELECT session_id, device_id, topic, gateway_ts_ns, raw_payload, numeric_value
-                FROM raw_events WHERE session_id IN ({placeholders})
-                ORDER BY session_id, device_id, topic, gateway_ts_ns, event_id""",
-            ids,
-        ).fetchall()
-    finally:
-        conn.close()
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for row in rows:
-        item = dict(row)
-        key = (str(item["session_id"]), str(item["device_id"]), str(item["topic"]))
-        grouped.setdefault(key, []).append(item)
-    return [
-        EvaluationGroup(f"clean:{sid}:{device}:{topic}", "clean", device, topic, tuple(events))
-        for (sid, device, topic), events in sorted(grouped.items())
-    ]
+def _load_clean_groups(
+    storage: LumenStorageManager,
+    session_ids: Iterable[str],
+    expected_curation_digests: dict[str, str] | None = None,
+) -> list[EvaluationGroup]:
+    from training.session_integrity import load_verified_clean_session_rows
 
+    verified = load_verified_clean_session_rows(
+        storage, session_ids, expected_curation_digests
+    )
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for session_id, rows in verified.items():
+        for item in rows:
+            key = (session_id, str(item["device_id"]), str(item["topic"]))
+            grouped.setdefault(key, []).append(item)
+    for events in grouped.values():
+        events.sort(key=lambda item: (int(item["gateway_ts_ns"]), int(item["event_id"])))
+    return [
+        EvaluationGroup(
+            f"clean:{session_id}:{device}:{topic}", "clean", device, topic, tuple(events)
+        )
+        for (session_id, device, topic), events in sorted(grouped.items())
+    ]
 
 def _load_incident_groups(storage: LumenStorageManager) -> tuple[list[EvaluationGroup], list[EvaluationGroup], list[EvaluationGroup]]:
     captures = storage.load_adversarial_regression_corpus(
@@ -97,7 +120,16 @@ def _load_incident_groups(storage: LumenStorageManager) -> tuple[list[Evaluation
             "hardware_fault": "fault",
         }[str(row["corpus_class"])]
         scenario, device, topic = _event_group_key(row, category)
-        grouped.setdefault((category, scenario, device, topic), []).append(dict(row))
+        item = dict(row)
+        try:
+            lab_metadata = json.loads(str(item.get("xai_contrib_json") or "{}"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("regression capture metadata is invalid JSON") from exc
+        operation = lab_metadata.get("operation", "put") if isinstance(lab_metadata, dict) else "put"
+        if operation not in {"put", "query", "declare_subscriber"}:
+            raise RuntimeError("regression capture contains an unsupported operation label")
+        item["operation"] = operation
+        grouped.setdefault((category, scenario, device, topic), []).append(item)
 
     attacks: list[EvaluationGroup] = []
     protocols: list[EvaluationGroup] = []
@@ -219,9 +251,12 @@ def _score_bundle(
     normal_scores: list[float] = []
     false_faults = 0
     total_faults = sum(group.category == "fault" for group in groups)
+    attack_total = sum(group.category == "attack" for group in groups)
+    protocol_total = sum(group.category == "protocol" for group in groups)
     attack_hits = 0
-    attack_total = sum(group.category in ("attack", "protocol") for group in groups)
-    latency: dict[str, int | None] = {}
+    protocol_hits = 0
+    attack_latency: dict[str, int | None] = {}
+    protocol_latency: dict[str, int | None] = {}
     clean_event_count = 0
     clean_security_alert_count = 0
     clean_operational_fault_count = 0
@@ -231,8 +266,8 @@ def _score_bundle(
         # labels. They are immediate protocol detections, not ML detections.
         if group.category == "protocol":
             detections[group.scenario_id] = {"detected": True, "latency": 1, "source": "protocol"}
-            attack_hits += 1
-            latency[group.scenario_id] = 1
+            protocol_hits += 1
+            protocol_latency[group.scenario_id] = 1
             continue
 
         extractor = DeviceTopicFeatureExtractor(seq_len=seq_len, stat_window=seq_len)
@@ -329,7 +364,7 @@ def _score_bundle(
         }
         if group.category == "attack" and detected:
             attack_hits += 1
-            latency[group.scenario_id] = detected_at
+            attack_latency[group.scenario_id] = detected_at
         if group.category == "fault" and detected:
             # A false cyber-quarantine is measured from the actual policy state,
             # not from a raw LSTM threshold crossing on a fault symptom.
@@ -344,7 +379,11 @@ def _score_bundle(
         "attack_total": attack_total,
         "attack_detected": attack_hits,
         "attack_recall": (attack_hits / attack_total) if attack_total else 0.0,
-        "attack_latency": latency,
+        "attack_latency": attack_latency,
+        "protocol_total": protocol_total,
+        "protocol_detected": protocol_hits,
+        "protocol_recall": (protocol_hits / protocol_total) if protocol_total else 0.0,
+        "protocol_latency": protocol_latency,
         "fault_total": total_faults,
         "false_fault_quarantines": false_faults,
         "normal_error_p95": normal_p95,
@@ -362,10 +401,11 @@ def evaluate_promotion_metrics(
     active_dir: Path,
     public_key_path: Path,
     heldout_session_ids: Iterable[str],
+    expected_curation_digests: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    clean = _load_clean_groups(storage, heldout_session_ids)
+    clean = _load_clean_groups(storage, heldout_session_ids, expected_curation_digests)
     attacks, protocols, captured_faults = _load_incident_groups(storage)
-    faults = captured_faults + _load_fault_scenarios()
+    faults = captured_faults if captured_faults else _load_fault_scenarios()
     if not clean:
         raise RuntimeError("promotion gate requires held-out clean sessions")
     if not attacks and not protocols:
@@ -390,6 +430,14 @@ def _promotion_gates(metrics: dict[str, Any], candidate_manifest: dict[str, Any]
     recall_ok = _finite_number(candidate["attack_recall"], "candidate.attack_recall") >= _finite_number(
         active["attack_recall"], "active.attack_recall"
     )
+    protocol_metrics_available = (
+        "protocol_recall" in candidate and "protocol_recall" in active
+    )
+    protocol_recall_ok = (
+        _finite_number(candidate["protocol_recall"], "candidate.protocol_recall")
+        >= _finite_number(active["protocol_recall"], "active.protocol_recall")
+        if protocol_metrics_available else True
+    )
     candidate_latency = candidate.get("attack_latency", {})
     active_latency = active.get("attack_latency", {})
     latency_ok = True
@@ -411,6 +459,7 @@ def _promotion_gates(metrics: dict[str, Any], candidate_manifest: dict[str, Any]
     return {
         "zero_increase_false_quarantines_on_faults": fault_no_regression,
         "attack_recall_not_worse_than_active": recall_ok,
+        "protocol_detection_not_worse_than_active": protocol_recall_ok,
         "attack_latency_not_worse_than_active": latency_ok,
         "normal_reconstruction_within_calibrated_bounds": normal_ok,
     }
@@ -433,129 +482,375 @@ def _append_audit(path: Path, document: dict[str, Any]) -> None:
             pass
 
 
-def evaluate_and_promote_candidate(
+def _canonical_report_bytes(document: dict[str, Any]) -> bytes:
+    return json.dumps(
+        document, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+
+
+def _candidate_report_provenance(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "dataset_policy": metadata["dataset_policy"],
+        "split_unit": metadata["split_unit"],
+        "train_sessions": list(metadata["train_sessions"]),
+        "validation_sessions": list(metadata["val_sessions"]),
+        "heldout_sessions": list(metadata["heldout_sessions"]),
+        "train_capture_runs": list(metadata["train_capture_runs"]),
+        "validation_capture_runs": list(metadata["val_capture_runs"]),
+        "heldout_capture_runs": list(metadata["heldout_capture_runs"]),
+        "capture_run_ids_by_session": dict(metadata["capture_run_ids_by_session"]),
+        "curation_digests": dict(metadata["curation_digests"]),
+    }
+
+
+def _candidate_evidence_snapshot(
+    candidate_dir: str | Path,
+    model_root: str | Path,
+) -> tuple[dict[str, Any], Any]:
+    root = Path(model_root).expanduser().resolve()
+    candidate = validate_unsigned_candidate_bundle(candidate_dir)
+    try:
+        relative = candidate.bundle_dir.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("candidate must reside under the configured model root") from exc
+    relative_path = PurePosixPath(relative)
+    if (
+        relative_path.is_absolute()
+        or len(relative_path.parts) < 2
+        or relative_path.parts[0] != "candidates"
+        or any(part in ("", ".", "..") for part in relative_path.parts)
+    ):
+        raise ValueError("candidate must reside under models/candidates")
+
+    artifacts = hash_unsigned_candidate_artifacts(candidate.bundle_dir)
+    declared = candidate.metadata["candidate_files_sha256"]
+    if artifacts != declared:
+        raise ValueError("candidate artifact hashes changed during evidence snapshot")
+    snapshot = {
+        "relative_path": relative,
+        "model_version": str(candidate.metadata.get("model_version") or "unknown"),
+        "manifest_sha256": sha256_file(candidate.bundle_dir / "manifest.json"),
+        "artifacts_sha256": artifacts,
+    }
+    return snapshot, candidate
+
+
+def _active_evidence_snapshot(
+    model_root: str | Path,
+    pointer_path: str | Path,
+    public_key_path: str | Path,
+) -> dict[str, Any]:
+    root = Path(model_root).expanduser().resolve()
+    pointer_requested = Path(pointer_path).expanduser()
+    if not pointer_requested.is_file() or _is_symlink_or_reparse(pointer_requested):
+        raise FileNotFoundError("active-model pointer must be a regular file inside models/")
+    pointer = pointer_requested.resolve()
+    try:
+        pointer_relative = pointer.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("active-model pointer must remain inside the model root") from exc
+
+    pointer_bytes = pointer.read_bytes()
+    try:
+        pointer_document = json.loads(pointer_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("active-model pointer JSON is invalid") from exc
+    if not isinstance(pointer_document, dict) or pointer_document.get("schema") != 1:
+        raise ValueError("invalid active-model pointer schema")
+
+    active_dir = resolve_active_bundle(root, pointer, root / "lumen_model_bundle")
+    verified = verify_and_load_bundle(active_dir, public_key_path)
+    try:
+        active_relative = active_dir.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("active bundle must remain inside the model root") from exc
+
+    manifest_hashes = verified.manifest.get("files_sha256")
+    if not isinstance(manifest_hashes, dict):
+        raise ValueError("active signed manifest has no artifact hash map")
+    return {
+        "pointer_relative_path": pointer_relative,
+        "pointer_sha256": hashlib.sha256(pointer_bytes).hexdigest(),
+        "pointer_document": pointer_document,
+        "bundle_relative_path": active_relative,
+        "model_version": str(verified.manifest.get("model_version") or "unknown"),
+        "manifest_sha256": sha256_file(active_dir / "model_manifest.json"),
+        "signature_sha256": sha256_file(active_dir / "model_manifest.sig"),
+        "artifacts_sha256": dict(sorted(manifest_hashes.items())),
+    }
+
+
+def _write_candidate_evaluation_report(
+    model_root: Path,
+    document: dict[str, Any],
+) -> tuple[Path, str]:
+    report_sha256 = hashlib.sha256(_canonical_report_bytes(document)).hexdigest()
+    payload_document = {**document, "report_sha256": report_sha256}
+    payload = _canonical_report_bytes(payload_document) + b"\n"
+
+    report_dir = model_root / "evaluations"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    if _is_symlink_or_reparse(report_dir):
+        raise ValueError("evaluation report directory must not be a symlink or reparse point")
+    report_path = report_dir / f"{document['report_id']}.json"
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(report_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name == "posix":
+            directory_fd = os.open(report_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        try:
+            report_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return report_path, report_sha256
+
+
+def verify_candidate_evaluation_report(
+    report_path: str | Path,
+    *,
+    model_root: str | Path,
+    public_key_path: str | Path,
+    candidate_dir: str | Path | None = None,
+    pointer_path: str | Path | None = None,
+) -> dict[str, Any]:
+    # Verify the report digest and revalidate its candidate and active snapshots.
+    # This is an integrity binding, not a digital signature or operator authorization.
+    root = Path(model_root).expanduser().resolve()
+    report_dir_requested = root / "evaluations"
+    if not report_dir_requested.is_dir() or _is_symlink_or_reparse(report_dir_requested):
+        raise ValueError("evaluation report directory must be a regular directory")
+    report_requested = Path(report_path).expanduser()
+    if not report_requested.is_file() or _is_symlink_or_reparse(report_requested):
+        raise ValueError("evaluation report must be a regular file")
+    report_file = report_requested.resolve()
+    report_dir = report_dir_requested.resolve()
+    if report_file.parent != report_dir:
+        raise ValueError("evaluation report must be a direct child of models/evaluations")
+
+    try:
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("evaluation report JSON is invalid") from exc
+    if not isinstance(report, dict) or report.get("schema") != "lumen-candidate-evaluation-report-v1":
+        raise ValueError("unsupported candidate evaluation report schema")
+
+    report_id = report.get("report_id")
+    if (
+        not isinstance(report_id, str)
+        or len(report_id) != 32
+        or any(ch not in "0123456789abcdef" for ch in report_id)
+        or report_file.name != f"{report_id}.json"
+    ):
+        raise ValueError("evaluation report ID or filename is invalid")
+
+    supplied_digest = report.get("report_sha256")
+    if (
+        not isinstance(supplied_digest, str)
+        or len(supplied_digest) != 64
+        or any(ch not in "0123456789abcdef" for ch in supplied_digest)
+    ):
+        raise ValueError("evaluation report SHA-256 is missing or invalid")
+    unsigned_report = {key: value for key, value in report.items() if key != "report_sha256"}
+    actual_digest = hashlib.sha256(_canonical_report_bytes(unsigned_report)).hexdigest()
+    if not hmac.compare_digest(actual_digest, supplied_digest):
+        raise ValueError("evaluation report SHA-256 mismatch")
+
+    candidate_record = report.get("candidate")
+    active_record = report.get("active")
+    provenance_record = report.get("data_provenance")
+    evaluation_record = report.get("evaluation")
+    if not all(isinstance(value, dict) for value in (
+        candidate_record, active_record, provenance_record, evaluation_record
+    )):
+        raise ValueError("evaluation report is missing structured evidence sections")
+
+    candidate_relative = candidate_record.get("relative_path")
+    if not isinstance(candidate_relative, str):
+        raise ValueError("evaluation report candidate path is invalid")
+    candidate_parts = PurePosixPath(candidate_relative)
+    if (
+        candidate_parts.is_absolute()
+        or len(candidate_parts.parts) < 2
+        or candidate_parts.parts[0] != "candidates"
+        or any(part in ("", ".", "..") for part in candidate_parts.parts)
+    ):
+        raise ValueError("evaluation report candidate path is unsafe")
+    current_candidate_dir = root.joinpath(*candidate_parts.parts)
+    if candidate_dir is not None and Path(candidate_dir).expanduser().resolve() != current_candidate_dir.resolve():
+        raise ValueError("supplied candidate path does not match the evaluation report")
+
+    # Preserve the lexical path so validate_unsigned_candidate_bundle can reject
+    # a symlink/reparse-point candidate root before resolving it.
+    current_candidate, candidate_bundle = _candidate_evidence_snapshot(
+        current_candidate_dir, root
+    )
+    if current_candidate != candidate_record:
+        raise ValueError("candidate snapshot no longer matches evaluation report")
+    current_provenance = _candidate_report_provenance(candidate_bundle.metadata)
+    if current_provenance != provenance_record:
+        raise ValueError("candidate training provenance no longer matches evaluation report")
+
+    pointer_relative = active_record.get("pointer_relative_path")
+    if not isinstance(pointer_relative, str):
+        raise ValueError("evaluation report active pointer path is invalid")
+    pointer_parts = PurePosixPath(pointer_relative)
+    if (
+        pointer_parts.is_absolute()
+        or not pointer_parts.parts
+        or any(part in ("", ".", "..") for part in pointer_parts.parts)
+    ):
+        raise ValueError("evaluation report active pointer path is unsafe")
+    stored_pointer = root.joinpath(*pointer_parts.parts)
+    if pointer_path is not None and Path(pointer_path).expanduser().resolve() != stored_pointer.resolve():
+        raise ValueError("supplied active pointer does not match the evaluation report")
+    current_active = _active_evidence_snapshot(
+        root, stored_pointer, public_key_path
+    )
+    if current_active != active_record:
+        raise ValueError("active model or pointer snapshot no longer matches evaluation report")
+
+    gates = evaluation_record.get("gates")
+    metrics = evaluation_record.get("metrics")
+    if (
+        not isinstance(gates, dict)
+        or not gates
+        or any(not isinstance(value, bool) for value in gates.values())
+        or not isinstance(metrics, dict)
+        or evaluation_record.get("all_gates_passed") is not all(gates.values())
+    ):
+        raise ValueError("evaluation report gate or metric structure is invalid")
+    return report
+
+
+def evaluate_candidate_only(
     candidate_dir: str | Path,
     *,
     storage: LumenStorageManager | None,
     public_key_path: str | Path,
-    private_key_path: str | Path | None,
     model_root: str | Path = "models",
     pointer_path: str | Path | None = None,
-    previous_pointer_path: str | Path | None = None,
     evaluator: Callable[..., dict[str, Any]] | None = None,
-) -> PromotionResult:
-    """Evaluate candidate offline; sign and promote only after every gate passes.
+) -> CandidateEvaluationResult:
+    # Validate and shadow-evaluate an unsigned candidate. No private key is accepted.
+    root = Path(model_root).expanduser().resolve()
+    pointer = (
+        Path(pointer_path).expanduser()
+        if pointer_path is not None
+        else root / "active_model.json"
+    )
+    public_key = Path(public_key_path).expanduser().resolve()
 
-    ``evaluator`` is injectable for deterministic unit tests. Production callers
-    leave it unset to run real CPU ONNX shadow inference over local SQLite data.
-    """
-    root = Path(model_root).resolve()
-    pointer = Path(pointer_path) if pointer_path is not None else root / "active_model.json"
-    if not pointer.is_absolute():
-        pointer = pointer.resolve()
-    candidate = validate_unsigned_candidate_bundle(candidate_dir)
-    candidate_root = (root / "candidates").resolve()
-    if candidate.bundle_dir != candidate_root and candidate_root not in candidate.bundle_dir.parents:
-        raise ValueError("candidate must reside under models/candidates")
-    key_path: Path | None = None
-    if private_key_path is not None and Path(private_key_path).is_file():
-        key_path = Path(private_key_path).resolve(strict=True)
-        if root == key_path or root in key_path.parents:
-            raise ValueError("model signing private key must remain outside the runtime model directory")
-    if not Path(public_key_path).is_file():
-        raise FileNotFoundError("runtime model-verification public key is unavailable")
-    if not pointer.is_file():
-        raise FileNotFoundError("active_model.json is required; promotion cannot bootstrap trust from a candidate")
-    active_dir = resolve_active_bundle(root, pointer, root / "lumen_model_bundle")
+    candidate_snapshot_before, candidate = _candidate_evidence_snapshot(candidate_dir, root)
+    active_snapshot_before = _active_evidence_snapshot(root, pointer, public_key)
+    active_parts = PurePosixPath(active_snapshot_before["bundle_relative_path"])
+    active_dir = root.joinpath(*active_parts.parts).resolve()
+
     if evaluator is None:
         if storage is None:
             raise ValueError("storage is required for production shadow evaluation")
         metrics = evaluate_promotion_metrics(
-            storage, candidate.bundle_dir, active_dir, Path(public_key_path),
+            storage,
+            candidate.bundle_dir,
+            active_dir,
+            public_key,
             candidate.metadata["heldout_sessions"],
+            candidate.metadata.get("curation_digests"),
         )
     else:
         metrics = evaluator(candidate.bundle_dir, active_dir, candidate.metadata)
+
     gates = _promotion_gates(metrics, candidate.metadata)
-    if not all(gates.values()):
-        result = PromotionResult(
-            promoted=False, candidate_dir=str(candidate.bundle_dir), gates=gates,
-            metrics=metrics, reason="CANDIDATE_REJECTED_BY_PROMOTION_GATES",
-        )
-        _append_audit(root / "promotion_history.jsonl", {
-            "at_ns": time.time_ns(), "candidate": candidate.metadata.get("model_version"),
-            "promoted": False, "gates": gates, "reason": result.reason,
-        })
-        return result
+    all_passed = all(gates.values())
+    reason = (
+        "ALL_EVALUATION_GATES_PASSED"
+        if all_passed
+        else "CANDIDATE_REJECTED_BY_EVALUATION_GATES"
+    )
 
-    # Without the offline private key, keep the candidate unsigned and do not
-    # change the active pointer even when every quality gate passes.
-    if key_path is None:
-        result = PromotionResult(
-            promoted=False,
-            candidate_dir=str(candidate.bundle_dir),
-            gates=gates,
-            metrics=metrics,
-            reason="OFFLINE_SIGNING_KEY_UNAVAILABLE",
-        )
-        _append_audit(root / "promotion_history.jsonl", {
-            "at_ns": time.time_ns(),
-            "candidate": candidate.metadata.get("model_version"),
-            "promoted": False,
+    # Re-hash both sides after inference. Any mutation invalidates this evaluation.
+    candidate_snapshot_after, candidate_after = _candidate_evidence_snapshot(candidate_dir, root)
+    active_snapshot_after = _active_evidence_snapshot(root, pointer, public_key)
+    if candidate_snapshot_after != candidate_snapshot_before:
+        raise RuntimeError("candidate changed during shadow evaluation")
+    if active_snapshot_after != active_snapshot_before:
+        raise RuntimeError("active model or pointer changed during shadow evaluation")
+    if _candidate_report_provenance(candidate_after.metadata) != _candidate_report_provenance(candidate.metadata):
+        raise RuntimeError("candidate training provenance changed during shadow evaluation")
+
+    report_id = uuid.uuid4().hex
+    report_document = {
+        "schema": "lumen-candidate-evaluation-report-v1",
+        "report_id": report_id,
+        "evaluated_at_unix_ns": time.time_ns(),
+        "candidate": candidate_snapshot_before,
+        "active": active_snapshot_before,
+        "data_provenance": _candidate_report_provenance(candidate.metadata),
+        "evaluation": {
             "gates": gates,
-            "reason": result.reason,
+            "metrics": metrics,
+            "all_gates_passed": all_passed,
+            "reason": reason,
+        },
+    }
+    report_path, report_sha256 = _write_candidate_evaluation_report(root, report_document)
+
+    audit_warning = None
+    try:
+        _append_audit(root / "candidate_evaluations.jsonl", {
+            "at_ns": report_document["evaluated_at_unix_ns"],
+            "event": "candidate_evaluated",
+            "report_id": report_id,
+            "report_path": report_path.relative_to(root).as_posix(),
+            "report_sha256": report_sha256,
+            "candidate": candidate.metadata.get("model_version"),
+            "active_bundle": active_snapshot_before["bundle_relative_path"],
+            "evaluated": True,
+            "all_gates_passed": all_passed,
+            "gates": gates,
+            "reason": reason,
         })
-        return result
+    except Exception as exc:
+        # The report is already durable; expose audit failure separately.
+        audit_warning = f"{type(exc).__name__}: {exc}"
 
-    metadata = dict(candidate.metadata)
-    metadata.update({
-        "promotion_gate": "passed",
-        "promotion_gates": gates,
-        "promotion_metrics": metrics,
-        "signed_by_authority": "local_offline_ed25519",
-    })
-    sign_model_bundle(candidate.bundle_dir, key_path, metadata=metadata)
-    # Immediately verify the just-signed artifact set before touching active pointer.
-    verify_and_load_bundle(candidate.bundle_dir, public_key_path)
-    pointer_doc = promote_candidate(
-        candidate.bundle_dir, public_key_path, model_root=root, pointer_path=pointer,
-        previous_pointer_path=previous_pointer_path,
-    )
-    _append_audit(root / "promotion_history.jsonl", {
-        "at_ns": time.time_ns(), "candidate": metadata.get("model_version"),
-        "promoted": True, "gates": gates, "active_pointer": pointer_doc,
-    })
-    return PromotionResult(
-        promoted=True, candidate_dir=str(candidate.bundle_dir), gates=gates,
-        metrics=metrics, reason="ALL_PROMOTION_GATES_PASSED", active_pointer=pointer_doc,
+    return CandidateEvaluationResult(
+        evaluated=True,
+        candidate_dir=str(candidate.bundle_dir),
+        active_bundle=str(active_dir),
+        gates=gates,
+        metrics=metrics,
+        all_gates_passed=all_passed,
+        reason=reason,
+        report_id=report_id,
+        report_path=str(report_path),
+        report_sha256=report_sha256,
+        candidate_manifest_sha256=candidate_snapshot_before["manifest_sha256"],
+        active_manifest_sha256=active_snapshot_before["manifest_sha256"],
+        audit_status="failed" if audit_warning else "written",
+        audit_warning=audit_warning,
     )
 
 
-def rollback_on_rate_spike(
-    observed: dict[str, float],
-    baseline: dict[str, float],
-    *,
-    model_root: str | Path,
-    public_key_path: str | Path,
-    pointer_path: str | Path | None = None,
-    anomaly_rate_margin: float = 0.05,
-    fault_rate_margin: float = 0.0,
-) -> dict[str, Any] | None:
-    """Automatically roll back when post-promotion anomaly/fault rates spike."""
-    if anomaly_rate_margin < 0 or fault_rate_margin < 0:
-        raise ValueError("rollback margins must be non-negative")
-    anomaly = _finite_number(observed.get("anomaly_rate"), "observed.anomaly_rate")
-    fault = _finite_number(observed.get("fault_rate"), "observed.fault_rate")
-    baseline_anomaly = _finite_number(baseline.get("anomaly_rate"), "baseline.anomaly_rate")
-    baseline_fault = _finite_number(baseline.get("fault_rate"), "baseline.fault_rate")
-    if anomaly > baseline_anomaly + anomaly_rate_margin or fault > baseline_fault + fault_rate_margin:
-        root = Path(model_root).resolve()
-        return rollback_model(
-            model_root=root,
-            pointer_path=pointer_path or root / "active_model.json",
-            public_key_path=public_key_path,
-        )
-    return None
+
+def evaluate_and_promote_candidate(*args, **kwargs):
+    raise PermissionError("combined evaluation/signing/deployment path is disabled; use evaluate_candidate_only(), sign_evaluated_candidate(), then deploy_signed_candidate()")
+
+
+
+def rollback_on_rate_spike(*args, **kwargs):
+    raise PermissionError("legacy rollback path is disabled; use training.deployment_authority")
+
 
 
 def read_post_promotion_rates(
@@ -594,40 +889,5 @@ def read_post_promotion_rates(
     }
 
 
-def monitor_post_promotion_rates(
-    storage: LumenStorageManager, *, model_root: str | Path, public_key_path: str | Path,
-    pointer_path: str | Path | None = None, window_sec: float = 300.0, min_events: int = 20,
-    anomaly_rate_margin: float = 0.05, fault_rate_margin: float = 0.01,
-) -> dict[str, Any] | None:
-    """Monitor recent local rates and automatically restore previous_model.json on regression."""
-    root = Path(model_root).resolve()
-    pointer = Path(pointer_path) if pointer_path is not None else root / "active_model.json"
-    active_dir = resolve_active_bundle(root, pointer, root / "lumen_model_bundle")
-    verified = verify_and_load_bundle(active_dir, public_key_path)
-    promotion = verified.manifest.get("promotion_metrics")
-    candidate_baseline = promotion.get("candidate") if isinstance(promotion, dict) else None
-    if not isinstance(candidate_baseline, dict):
-        return None
-    if "clean_security_alert_rate" not in candidate_baseline or "clean_operational_fault_rate" not in candidate_baseline:
-        # Older signed models lack rate baselines: fail safe by not inventing a
-        # reference. A future successful promotion writes both values.
-        return None
-    observed = read_post_promotion_rates(storage, window_sec=window_sec, min_events=min_events)
-    if observed is None:
-        return None
-    baseline = {
-        "anomaly_rate": _finite_number(candidate_baseline["clean_security_alert_rate"], "baseline.clean_security_alert_rate"),
-        "fault_rate": _finite_number(candidate_baseline["clean_operational_fault_rate"], "baseline.clean_operational_fault_rate"),
-    }
-    rollback = rollback_on_rate_spike(
-        observed, baseline, model_root=root, public_key_path=public_key_path, pointer_path=pointer,
-        anomaly_rate_margin=anomaly_rate_margin, fault_rate_margin=fault_rate_margin,
-    )
-    if rollback is None:
-        return {"rollback": False, "observed": observed, "baseline": baseline}
-    result = {"rollback": True, "observed": observed, "baseline": baseline, "pointer": rollback}
-    _append_audit(root / "promotion_history.jsonl", {
-        "at_ns": time.time_ns(), "event": "automatic_post_promotion_rollback",
-        "observed_rates": observed, "baseline_rates": baseline, "active_pointer": rollback,
-    })
-    return result
+def monitor_post_promotion_rates(*args, **kwargs):
+    raise PermissionError("legacy deployment monitor is disabled; use training.deployment_authority")

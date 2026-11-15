@@ -13,7 +13,7 @@ import json
 import os
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -208,6 +208,193 @@ def sign_model_bundle(bundle_dir: Path, private_key_path: Path, metadata: dict[s
     return manifest
 
 
+
+def sign_model_bundle_transactional(
+    bundle_dir: Path,
+    private_key_path: Path,
+    public_key_path: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Stage, verify, then publish a signed candidate.
+
+    The original unsigned manifest.json is preserved.
+
+    Ordinary Python-level publication failures remove partially published
+    runtime signature files and restore the candidate to its unsigned state.
+
+    This is not a power-loss transaction. Durable crash recovery is reserved
+    for the later signing/deployment journal stage.
+    """
+    import shutil
+    import tempfile
+
+    root = _safe_bundle_root(bundle_dir)
+
+    unsigned_manifest = root / "manifest.json"
+    if not unsigned_manifest.is_file():
+        raise FileNotFoundError(
+            "unsigned candidate manifest.json is missing"
+        )
+
+    if (root / MANIFEST_NAME).exists() or (root / SIGNATURE_NAME).exists():
+        raise ValueError(
+            "transactional signing requires an unsigned candidate"
+        )
+
+    # Snapshot every original candidate artifact.
+    original_snapshot = {
+        name: sha256_file(path)
+        for name, path in _artifact_files(root).items()
+    }
+
+    if "manifest.json" not in original_snapshot:
+        raise ValueError(
+            "candidate provenance manifest is not in the artifact set"
+        )
+
+    staging_parent = Path(tempfile.mkdtemp(
+        prefix=".lumen-signing-stage-",
+        dir=root.parent,
+    ))
+
+    staged_bundle = staging_parent / "bundle"
+
+    try:
+        staged_bundle.mkdir()
+
+        # Copy only regular files discovered by the no-follow scanner.
+        for relative, source in _artifact_files(root).items():
+            target = staged_bundle.joinpath(
+                *PurePosixPath(relative).parts
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+
+        staged_snapshot = {
+            name: sha256_file(path)
+            for name, path in _artifact_files(staged_bundle).items()
+        }
+
+        if staged_snapshot != original_snapshot:
+            raise RuntimeError(
+                "staged candidate differs from original candidate"
+            )
+
+        # Sign only the staging copy.
+        signed_manifest = sign_model_bundle(
+            staged_bundle,
+            private_key_path,
+            metadata=metadata,
+        )
+
+        # Verify staged output before publishing anything.
+        verified = verify_and_load_bundle(
+            staged_bundle,
+            public_key_path,
+        )
+
+        if verified.manifest != signed_manifest:
+            raise RuntimeError(
+                "staged signed manifest verification mismatch"
+            )
+
+        # Confirm original candidate did not change during signing.
+        current_snapshot = {
+            name: sha256_file(path)
+            for name, path in _artifact_files(root).items()
+        }
+
+        if current_snapshot != original_snapshot:
+            raise RuntimeError(
+                "original candidate changed during signing"
+            )
+
+        staged_manifest = staged_bundle / MANIFEST_NAME
+        staged_signature = staged_bundle / SIGNATURE_NAME
+
+        manifest_bytes = staged_manifest.read_bytes()
+        signature_bytes = staged_signature.read_bytes()
+
+        manifest_tmp = staging_parent / f".{MANIFEST_NAME}.publish"
+        signature_tmp = staging_parent / f".{SIGNATURE_NAME}.publish"
+
+        for temp_path in (manifest_tmp, signature_tmp):
+            if temp_path.exists() or temp_path.is_symlink():
+                raise FileExistsError(
+                    f"unexpected publication temporary file: {temp_path}"
+                )
+
+        try:
+            # Prepare both files before replacing either destination.
+            for temp_path, payload in (
+                (manifest_tmp, manifest_bytes),
+                (signature_tmp, signature_bytes),
+            ):
+                with temp_path.open("xb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+            # Last candidate-integrity check before publication.
+            final_snapshot = {
+                name: sha256_file(path)
+                for name, path in _artifact_files(root).items()
+            }
+
+            if final_snapshot != original_snapshot:
+                raise RuntimeError(
+                    "candidate changed immediately before publication"
+                )
+
+            # Two atomic file replacements. The pair is not crash-atomic.
+            os.replace(
+                manifest_tmp,
+                root / MANIFEST_NAME,
+            )
+
+            os.replace(
+                signature_tmp,
+                root / SIGNATURE_NAME,
+            )
+
+            # Verify the published candidate itself.
+            final_verified = verify_and_load_bundle(
+                root,
+                public_key_path,
+            )
+
+            if final_verified.manifest != signed_manifest:
+                raise RuntimeError(
+                    "published candidate differs from staged signed bundle"
+                )
+
+            return signed_manifest
+
+        except BaseException:
+            # This operation began with an unsigned candidate.
+            # Remove partial runtime signing artifacts on ordinary failure.
+            for name in (MANIFEST_NAME, SIGNATURE_NAME):
+                target = root / name
+
+                if target.exists() and not target.is_symlink():
+                    target.unlink()
+
+            raise
+
+        finally:
+            for temp_path in (
+                staging_parent / f".{MANIFEST_NAME}.publish",
+                staging_parent / f".{SIGNATURE_NAME}.publish",
+            ):
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    finally:
+        shutil.rmtree(staging_parent, ignore_errors=True)
+
+
 @dataclass(frozen=True)
 class VerifiedModelBundle:
     bundle_dir: Path
@@ -216,61 +403,171 @@ class VerifiedModelBundle:
     feature_schema: dict[str, Any]
     scaler: dict[str, Any]
     thresholds: dict[str, Any]
+    # Keep the private snapshot alive for as long as this verified object lives.
+    _snapshot_owner: Any = field(repr=False, compare=False)
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.onnx_path.parent
+
+    def close(self) -> None:
+        # Explicitly release the verified snapshot when its consumer is finished.
+        self._snapshot_owner.cleanup()
+
+
+def _read_plain_file_bytes(path: Path) -> bytes:
+    # Read a regular file through an opened descriptor, refusing links.
+    path = Path(path)
+    _assert_plain_file(path)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"bundle file is not a regular file: {path}")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            payload = handle.read()
+    finally:
+        os.close(fd)
+    _assert_plain_file(path)
+    return payload
+
+
+def _copy_verified_artifact(source: Path, target: Path, expected_digest: str) -> None:
+    # Hash exactly the bytes copied from one opened source descriptor.
+    source = Path(source)
+    target = Path(target)
+    _assert_plain_file(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(source, flags)
+    digest = hashlib.sha256()
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"bundle artifact is not a regular file: {source}")
+        with os.fdopen(fd, "rb", closefd=False) as reader:
+            with target.open("xb") as writer:
+                for chunk in iter(lambda: reader.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    writer.write(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+    finally:
+        os.close(fd)
+
+    observed = digest.hexdigest()
+    if not hmac.compare_digest(observed, expected_digest):
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise ValueError(f"SECURITY ALERT: SHA-256 mismatch while snapshotting {source.name}")
+
+    if not hmac.compare_digest(sha256_file(target), expected_digest):
+        raise ValueError(f"SECURITY ALERT: verified snapshot changed during creation: {target}")
+
+    # Read-only is defense in depth; private temp-directory ACLs are the
+    # primary cross-process boundary. The owning OS account can still override it.
+    try:
+        target.chmod(stat.S_IRUSR)
+    except OSError:
+        pass
 
 
 def verify_and_load_bundle(bundle_dir: str | Path, public_key_path: str | Path) -> VerifiedModelBundle:
+    # Verify a signed bundle and return data/model paths from a private snapshot.
+    import tempfile
+
     root = _safe_bundle_root(bundle_dir)
     manifest_path = root / MANIFEST_NAME
     signature_path = root / SIGNATURE_NAME
     if not manifest_path.exists() or not signature_path.exists():
         raise FileNotFoundError(f"unsigned or incomplete model bundle in {root}")
-    _assert_plain_file(manifest_path)
-    _assert_plain_file(signature_path)
+
+    raw_manifest = _read_plain_file_bytes(manifest_path)
+    raw_signature = _read_plain_file_bytes(signature_path)
     public_key = serialization.load_pem_public_key(Path(public_key_path).read_bytes())
     if not isinstance(public_key, Ed25519PublicKey):
         raise TypeError("Expected Ed25519 public key for bundle verification")
-    raw_manifest = manifest_path.read_bytes()
+
     try:
-        signature = base64.b64decode(signature_path.read_text(encoding="ascii").strip(), validate=True)
+        signature = base64.b64decode(raw_signature.decode("ascii").strip(), validate=True)
         public_key.verify(signature, raw_manifest)
-    except (InvalidSignature, ValueError) as exc:
+    except (InvalidSignature, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("SECURITY ALERT: model manifest Ed25519 signature verification failed") from exc
+
     try:
         manifest = json.loads(raw_manifest.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid model manifest JSON") from exc
+
     if not isinstance(manifest, dict) or manifest.get("bundle_format") != "lumen-model-bundle-v5":
         raise ValueError("unsupported model bundle format")
     expected = manifest.get("files_sha256")
     if not isinstance(expected, dict):
         raise ValueError("manifest files_sha256 must be an object")
+
     artifacts = _artifact_files(root)
     actual_names = set(artifacts)
     expected_names = set(expected)
     if actual_names != expected_names:
         missing_hashes = sorted(actual_names - expected_names)
         missing_files = sorted(expected_names - actual_names)
-        raise ValueError(f"bundle file set mismatch: unhashed={missing_hashes}, missing={missing_files}")
-    for name, path in artifacts.items():
+        raise ValueError(
+            f"bundle file set mismatch: unhashed={missing_hashes}, missing={missing_files}"
+        )
+
+    normalized_hashes: dict[str, str] = {}
+    for name, digest in expected.items():
         _safe_relative_path(name)
-        digest = expected.get(name)
-        if not isinstance(digest, str) or len(digest) != 64:
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in digest.lower())
+        ):
             raise ValueError(f"invalid SHA-256 declaration for {name}")
-        if not hmac.compare_digest(sha256_file(path), digest.lower()):
-            raise ValueError(f"SECURITY ALERT: SHA-256 mismatch for {name}")
-    def read_json(name: str) -> dict[str, Any]:
-        value = json.loads((root / name).read_text(encoding="utf-8"))
-        if not isinstance(value, dict):
-            raise ValueError(f"{name} must contain a JSON object")
-        return value
-    return VerifiedModelBundle(
-        bundle_dir=root,
-        onnx_path=root / "model.onnx",
-        manifest=manifest,
-        feature_schema=read_json("feature_schema.json"),
-        scaler=read_json("scaler.json"),
-        thresholds=read_json("thresholds.json"),
-    )
+        normalized_hashes[name] = digest.lower()
+
+    # Snapshot outside the mutable source bundle. On Windows the directory
+    # inherits the current user's temp-directory ACL; POSIX temp dirs are private.
+    owner = tempfile.TemporaryDirectory(prefix="lumen-verified-bundle-")
+    snapshot_root = Path(owner.name)
+    try:
+        for name, source_path in artifacts.items():
+            relative = _safe_relative_path(name)
+            target = snapshot_root.joinpath(*relative.parts)
+            _copy_verified_artifact(source_path, target, normalized_hashes[name])
+
+        (snapshot_root / MANIFEST_NAME).write_bytes(raw_manifest)
+        (snapshot_root / SIGNATURE_NAME).write_bytes(raw_signature)
+
+        snapshot_artifacts = _artifact_files(snapshot_root)
+        if set(snapshot_artifacts) != expected_names:
+            raise ValueError("verified snapshot artifact set changed during creation")
+        for name, path in snapshot_artifacts.items():
+            if not hmac.compare_digest(sha256_file(path), normalized_hashes[name]):
+                raise ValueError(f"SECURITY ALERT: snapshot artifact verification failed: {name}")
+
+        def read_snapshot_json(name: str) -> dict[str, Any]:
+            value = json.loads((snapshot_root / name).read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError(f"{name} must contain a JSON object")
+            return value
+
+        return VerifiedModelBundle(
+            bundle_dir=root,
+            onnx_path=snapshot_root / "model.onnx",
+            manifest=manifest,
+            feature_schema=read_snapshot_json("feature_schema.json"),
+            scaler=read_snapshot_json("scaler.json"),
+            thresholds=read_snapshot_json("thresholds.json"),
+            _snapshot_owner=owner,
+        )
+    except BaseException:
+        owner.cleanup()
+        raise
 
 
 def hash_unsigned_candidate_artifacts(bundle_dir: str | os.PathLike[str]) -> dict[str, str]:
@@ -359,6 +656,60 @@ def validate_unsigned_candidate_bundle(bundle_dir: str | Path) -> UnsignedCandid
             raise ValueError(f"candidate {label} must be a non-empty list of session IDs")
     if set(train) & set(validation) or set(train) & set(heldout) or set(validation) & set(heldout):
         raise ValueError("training, validation and held-out sessions must be disjoint")
+    if any(len(set(value)) != len(value) for value in (train, validation, heldout, cusum)):
+        raise ValueError("candidate session partition lists must not contain duplicates")
+    if metadata.get("split_unit") != "capture_run_id":
+        raise ValueError("unsigned V6 candidate must be partitioned by capture_run_id")
+    capture_map = metadata.get("capture_run_ids_by_session")
+    if not isinstance(capture_map, dict) or set(capture_map) != (set(train) | set(validation) | set(heldout)):
+        raise ValueError("candidate must map every partition session to its capture_run_id")
+    for session_id, capture_run_id in capture_map.items():
+        if (
+            not isinstance(capture_run_id, str)
+            or len(capture_run_id) != 32
+            or capture_run_id != capture_run_id.lower()
+            or any(ch not in "0123456789abcdef" for ch in capture_run_id)
+            or not session_id.startswith(f"baseline-lab-{capture_run_id}-")
+        ):
+            raise ValueError("candidate contains invalid session capture_run_id provenance")
+
+    run_partitions = (
+        ("train_capture_runs", train),
+        ("val_capture_runs", validation),
+        ("heldout_capture_runs", heldout),
+    )
+    capture_sets: dict[str, set[str]] = {}
+    for field, session_partition in run_partitions:
+        values = metadata.get(field)
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(
+                not isinstance(value, str)
+                or len(value) != 32
+                or value != value.lower()
+                or any(ch not in "0123456789abcdef" for ch in value)
+                for value in values
+            )
+            or len(set(values)) != len(values)
+        ):
+            raise ValueError(f"candidate {field} must be a non-empty unique list of capture_run_id values")
+        observed = {capture_map[session_id] for session_id in session_partition}
+        if observed != set(values):
+            raise ValueError(f"candidate {field} does not match its session capture_run_id provenance")
+        capture_sets[field] = set(values)
+    if (
+        capture_sets["train_capture_runs"] & capture_sets["val_capture_runs"]
+        or capture_sets["train_capture_runs"] & capture_sets["heldout_capture_runs"]
+        or capture_sets["val_capture_runs"] & capture_sets["heldout_capture_runs"]
+    ):
+        raise ValueError("candidate capture_run_id partitions must be disjoint")
+    if set(capture_map.values()) != (
+        capture_sets["train_capture_runs"]
+        | capture_sets["val_capture_runs"]
+        | capture_sets["heldout_capture_runs"]
+    ):
+        raise ValueError("candidate capture_run_id partition coverage is incomplete")
     if not set(cusum).issubset(set(train)):
         raise ValueError("CUSUM calibration may use training sessions only")
     curation_digests = metadata.get("curation_digests")

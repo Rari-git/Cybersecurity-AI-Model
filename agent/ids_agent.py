@@ -141,6 +141,9 @@ class ZenohIDSAgent:
         self.scaler: RobustFeatureScaler | None = None
         self.xai: NormalizedXaiExplainer | None = None
 
+        # Keep the verified model snapshot alive for the full IDS runtime lifetime.
+        self._verified_bundle = None
+
         explicit_bundle = os.environ.get("LUMEN_MODEL_BUNDLE_DIR")
         if explicit_bundle:
             bdir = Path(explicit_bundle)
@@ -224,43 +227,56 @@ class ZenohIDSAgent:
 
     def _load_verified_bundle(self, bundle_dir: Path, pub_key_path: Path) -> None:
         verified = verify_and_load_bundle(bundle_dir, pub_key_path)
-        schema_ver = verified.feature_schema.get("schema_version")
-        if schema_ver != FEATURE_SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Schema model incompatibilă: bundle={schema_ver} != runtime={FEATURE_SCHEMA_VERSION}"
+        try:
+            schema_ver = verified.feature_schema.get("schema_version")
+            if schema_ver != FEATURE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Schema model incompatibilă: bundle={schema_ver} != runtime={FEATURE_SCHEMA_VERSION}"
+                )
+            if int(verified.feature_schema.get("feature_dim", 0)) != FEATURE_DIM:
+                raise RuntimeError("Dimensiune vector trăsături incompatibilă în bundle")
+
+            self.seq_len = int(verified.feature_schema["seq_len"])
+            self.scaler = RobustFeatureScaler.from_dict(verified.scaler)
+            self.global_threshold = float(verified.thresholds["global_threshold"])
+            self.stream_thresholds = {
+                k: float(v) for k, v in verified.thresholds.get("stream_thresholds", {}).items()
+            }
+            self.xai = NormalizedXaiExplainer(verified.thresholds["xai_error_scales"])
+            self._cusum_baselines = verified.thresholds.get("cusum_baselines", {})
+
+            so = ort.SessionOptions()
+            so.intra_op_num_threads = 1
+            so.inter_op_num_threads = 1
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            session = ort.InferenceSession(
+                str(verified.onnx_path), so, providers=["CPUExecutionProvider"]
             )
-        if int(verified.feature_schema.get("feature_dim", 0)) != FEATURE_DIM:
-            raise RuntimeError("Dimensiune vector trăsături incompatibilă în bundle")
+            model_input = session.get_inputs()[0]
+            in_shape = list(model_input.shape)
+            if len(in_shape) != 3 or (isinstance(in_shape[2], int) and in_shape[2] != FEATURE_DIM):
+                raise RuntimeError(f"Model ONNX cu intrare invalidă {in_shape}")
 
-        self.seq_len = int(verified.feature_schema["seq_len"])
-        self.scaler = RobustFeatureScaler.from_dict(verified.scaler)
-        self.global_threshold = float(verified.thresholds["global_threshold"])
-        self.stream_thresholds = {
-            k: float(v) for k, v in verified.thresholds.get("stream_thresholds", {}).items()
-        }
-        self.xai = NormalizedXaiExplainer(verified.thresholds["xai_error_scales"])
-        self._cusum_baselines = verified.thresholds.get("cusum_baselines", {})
-
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = 1
-        so.inter_op_num_threads = 1
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.ort_session = ort.InferenceSession(
-            str(verified.onnx_path), so, providers=["CPUExecutionProvider"]
-        )
-        model_input = self.ort_session.get_inputs()[0]
-        self.input_name = model_input.name
-        in_shape = list(model_input.shape)
-        if len(in_shape) != 3 or (isinstance(in_shape[2], int) and in_shape[2] != FEATURE_DIM):
-            raise RuntimeError(f"Model ONNX cu intrare invalidă {in_shape}")
-
-        self.ml_enabled = True
-        logger.info(
-            "[IDS AGENT v5.0] Bundle Ed25519 verificat cu succes: version=%s seq_len=%d thr=%.4f",
-            verified.manifest.get("model_version"),
-            self.seq_len,
-            self.global_threshold,
-        )
+            # Publish the session and its verification owner together, only after
+            # every validation step succeeds. The snapshot must outlive the session.
+            self.ort_session = session
+            self._verified_bundle = verified
+            self.input_name = model_input.name
+            self.ml_enabled = True
+            logger.info(
+                "[IDS AGENT v5.0] Bundle Ed25519 verificat cu succes: version=%s seq_len=%d thr=%.4f",
+                verified.manifest.get("model_version"),
+                self.seq_len,
+                self.global_threshold,
+            )
+        except BaseException:
+            # Do not leave a snapshot behind if schema/config/ORT initialization fails.
+            self.ort_session = None
+            try:
+                verified.close()
+            except Exception:
+                logger.exception("Failed to clean up rejected verified model snapshot")
+            raise
 
     def _resolve_device_id(self, topic: str, device_id: str | None = None) -> str:
         """Resolve only an envelope-bound stable ID; never infer from shared-topic suffixes."""
@@ -875,8 +891,24 @@ class ZenohIDSAgent:
                 self.storage.close()
             except Exception:
                 pass
-            self.session.close()
-            self.replay_store.close()
+            try:
+                self.session.close()
+            except Exception:
+                logger.exception("Failed to close IDS Zenoh session")
+            try:
+                self.replay_store.close()
+            except Exception:
+                logger.exception("Failed to close IDS replay store")
+            finally:
+                # Release the ONNX session before deleting its verified model snapshot.
+                self.ort_session = None
+                verified_bundle = getattr(self, "_verified_bundle", None)
+                self._verified_bundle = None
+                if verified_bundle is not None:
+                    try:
+                        verified_bundle.close()
+                    except Exception:
+                        logger.exception("Failed to clean up verified model snapshot")
 
 
 if __name__ == "__main__":

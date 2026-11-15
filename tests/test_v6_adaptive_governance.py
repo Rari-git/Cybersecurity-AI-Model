@@ -101,7 +101,15 @@ def test_attack_or_protocol_incident_session_is_rejected_and_indexed_separately(
     storage = LumenStorageManager(paths=DBPaths.from_dir(tmp_path / "db"), enable_writers=True)
     try:
         _create_session(storage, "poisoned-one")
-        persist_incident_capture(storage, _incident_row("poisoned-one", "REPLAY_SEQUENCE_REJECTED"))
+        storage.register_regression_scenario(
+            "scenario-replay-1", "protocol", runner_version="pytest-stage-b1",
+            manifest={"scenario": "authenticated-replay", "fixture": "duplicate-v6-sequence"},
+        )
+        persist_incident_capture(
+            storage, _incident_row("poisoned-one", "REPLAY_OR_OUT_OF_ORDER_SEQUENCE",
+                                   source="ids_alert", label=None)
+        )
+        assert storage.complete_regression_scenario("scenario-replay-1") == 1
         decision = curate_clean_sessions(
             storage, min_duration_sec=0, min_sensor_coverage=1.0, session_ids=["poisoned-one"]
         )[0]
@@ -109,7 +117,7 @@ def test_attack_or_protocol_incident_session_is_rejected_and_indexed_separately(
         assert "INCIDENT_PROTOCOL_OR_FORENSIC_CAPTURE_PRESENT" in decision.reasons
         corpus = storage.load_adversarial_regression_corpus(("protocol_violation",))
         assert len(corpus) == 1
-        assert corpus[0]["reason_code"] == "REPLAY_SEQUENCE_REJECTED"
+        assert corpus[0]["reason_code"] == "REPLAY_OR_OUT_OF_ORDER_SEQUENCE"
         conn = storage.connect_readonly("normal")
         try:
             status = conn.execute(
@@ -150,6 +158,14 @@ def test_training_rechecks_curation_digest_before_reading_approved_session(tmp_p
         _create_session(storage, "integrity-two", count=20)
         curate_clean_sessions(
             storage, min_duration_sec=0, min_sensor_coverage=1.0, session_ids=["integrity-one", "integrity-two"]
+        )
+        # Simulate an out-of-band DB-file writer: normal SQL writes must be
+        # rejected by the B5.5.6 immutability trigger, so remove the trigger
+        # explicitly before testing the independent curation-digest safeguard.
+        storage._writers["normal"].submit_sync(
+            lambda conn: conn.execute(
+                "DROP TRIGGER trg_curated_raw_events_immutable_update"
+            )
         )
         storage._writers["normal"].submit_sync(
             lambda conn: conn.execute(
