@@ -51,14 +51,40 @@ def _no_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_json(path: Path, *, max_bytes: int) -> tuple[dict[str, Any], bytes]:
+def _read_json_snapshot(path: Path, *, max_bytes: int) -> tuple[dict[str, Any], bytes]:
+    """Read once from a checked descriptor; returned bytes are the sole snapshot."""
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
             raise EvidenceError(f"evidence artifact is not a regular file: {path.name}")
-        if info.st_size > max_bytes:
+        if before.st_size > max_bytes:
             raise EvidenceError(f"evidence artifact exceeds size limit: {path.name}")
-        raw = path.read_bytes()
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise EvidenceError(f"evidence artifact is not a regular file: {path.name}")
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise EvidenceError(f"evidence artifact changed while opening: {path.name}")
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining:
+                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(fd)
+            if len(raw) > max_bytes:
+                raise EvidenceError(f"evidence artifact exceeds size limit: {path.name}")
+            if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise EvidenceError(f"evidence artifact changed during read: {path.name}")
+        finally:
+            os.close(fd)
+    except EvidenceError:
+        raise
     except OSError as exc:
         raise EvidenceError(f"unable to read evidence artifact {path.name}: {exc}") from exc
     try:
@@ -69,6 +95,23 @@ def _read_json(path: Path, *, max_bytes: int) -> tuple[dict[str, Any], bytes]:
     if not isinstance(value, dict):
         raise EvidenceError(f"JSON artifact must contain an object: {path.name}")
     return value, raw
+
+
+def _read_json(path: Path, *, max_bytes: int) -> tuple[dict[str, Any], bytes]:
+    return _read_json_snapshot(path, max_bytes=max_bytes)
+
+
+def _verify_manifest_snapshot(envelope: Mapping[str, Any]) -> dict[str, Any]:
+    manifest = envelope.get("manifest")
+    expected = envelope.get("manifest_sha256")
+    if not isinstance(manifest, dict) or not isinstance(expected, str):
+        raise EvidenceError("invalid manifest envelope")
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if hashlib.sha256(canonical).hexdigest() != expected:
+        raise EvidenceError("manifest SHA-256 integrity verification failed")
+    if manifest.get("schema_version") != "c2.staging-manifest.v1":
+        raise EvidenceError("unsupported staging manifest schema")
+    return manifest
 
 
 def _sha256(raw: bytes) -> str:
@@ -121,8 +164,8 @@ def _build_payload(
             raise EvidenceError(f"required evidence artifact is missing or is a link: {required_name}")
 
     try:
-        _manifest_envelope, manifest_raw = _read_json(manifest_path, max_bytes=max_artifact_bytes)
-        manifest = verify_manifest(manifest_path, max_bytes=max_artifact_bytes)
+        manifest_envelope, manifest_raw = _read_json_snapshot(manifest_path, max_bytes=max_artifact_bytes)
+        manifest = _verify_manifest_snapshot(manifest_envelope)
     except (ManifestError, EvidenceError) as exc:
         raise EvidenceError(f"manifest verification failed: {exc}") from exc
     summary, summary_raw = _read_json(summary_path, max_bytes=max_artifact_bytes)
@@ -189,6 +232,7 @@ def _build_payload(
     frame_hasher = hashlib.sha256()
     frame_artifacts: list[dict[str, Any]] = []
     frame_total_bytes = 0
+    raw_payload_bytes = 0
     variation_id = summary["variation_id"]
     for expected_step, frame_path in enumerate(frame_paths):
         record, raw = _read_json(frame_path, max_bytes=max_artifact_bytes)
@@ -212,9 +256,10 @@ def _build_payload(
         if not isinstance(payload, str):
             raise EvidenceError(f"invalid encoded payload: {frame_path.name}")
         try:
-            base64.b64decode(payload, validate=True)
+            decoded_payload = base64.b64decode(payload, validate=True)
         except (ValueError, base64.binascii.Error) as exc:
             raise EvidenceError(f"invalid Base64 payload: {frame_path.name}") from exc
+        raw_payload_bytes += len(decoded_payload)
         frame_hasher.update(len(raw).to_bytes(8, "big"))
         frame_hasher.update(raw)
         frame_total_bytes += len(raw)
@@ -278,7 +323,7 @@ def _build_payload(
         "frame_count": len(frame_paths),
         "frames_sha256": frames_digest,
         "resource_accounting": {
-            "raw_payload_bytes": sum(len(base64.b64decode(json.loads(p.read_text(encoding="utf-8"))["payload_base64"], validate=True)) for p in frame_paths),
+            "raw_payload_bytes": raw_payload_bytes,
             "serialized_frame_artifact_bytes": frame_total_bytes,
             "total_persisted_evidence_bytes": total_bytes,
             "max_payload_bytes": max_payload,
