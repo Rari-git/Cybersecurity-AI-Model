@@ -1,3 +1,0 @@
-python training/train_local_lstm.py --db-dir logs/db --bundle-dir models/lumen_model_bundle --epochs 35
-python training/evaluate_v5.py
-pytest -v
