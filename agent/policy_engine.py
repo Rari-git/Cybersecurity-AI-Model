@@ -50,6 +50,9 @@ class DetectionEvidence:
     deterministic_violation: bool = False
     deterministic_reason: str = ""
     xai_summary: str = ""
+    # Descriptive transition context is retained with the evidence but does
+    # not influence risk, hysteresis, enforcement, or recovery decisions.
+    behavioral_transition_summary: str = ""
     # Cryptographic revocation is a separate, explicit decision.
     revocation_requested: bool = False
     # V6 protocol evidence is admitted to the policy layer without being fed to

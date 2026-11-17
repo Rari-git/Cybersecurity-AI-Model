@@ -38,6 +38,7 @@ from training.feature_extractor import (
 )
 from agent.enforcement import EnforcementEngine, sanitize, ALERT_TOPIC
 from agent.statistical_detectors import TwoSidedCusumDetector, OperationalFaultClassifier
+from agent.runtime_transitions import RuntimeTransitionObserver
 from agent.policy_engine import RiskPolicyEngine, DetectionEvidence
 from agent.pep_protocol import PepAckRegistry, PepAcknowledgement
 from storage.telemetry_db import LumenStorageManager, DBPaths
@@ -170,6 +171,7 @@ class ZenohIDSAgent:
         self.extractor = DeviceTopicFeatureExtractor(seq_len=self.seq_len, stat_window=self.seq_len)
         self.cusum = TwoSidedCusumDetector(k_allowance=0.5, h_threshold=6.0)
         self.fault_classifier = OperationalFaultClassifier(frozen_min_steps=8)
+        self.transition_observer = RuntimeTransitionObserver()
 
         if self.ml_enabled and hasattr(self, "_cusum_baselines"):
             for skey, st in self._cusum_baselines.items():
@@ -547,6 +549,13 @@ class ZenohIDSAgent:
                 delta_t=delta_t,
                 operation="put",
             )
+            transition_observation = self.transition_observer.observe(
+                device_id=device_id,
+                generation=generation,
+                topic=key,
+                payload_len=len(raw_bytes),
+                delta_t_seconds=delta_t,
+            )
             window = self.extractor.get_window(device_id, key)
 
         if op_health.status == "FAULT":
@@ -581,6 +590,8 @@ class ZenohIDSAgent:
             lstm_score = FAIL_CLOSED_LOSS
             lstm_anomalous = True
 
+        xai_summary = xai_report.summary_text if xai_report else f"CUSUM={cusum_res.score:.2f}"
+        xai_summary = f"{xai_summary[:300]}; {transition_observation.explanation}"[:500]
         evidence = DetectionEvidence(
             device_id=device_id,
             generation=generation,
@@ -594,7 +605,8 @@ class ZenohIDSAgent:
             fault_type=op_health.fault_type,
             deterministic_violation=bool(flood),
             deterministic_reason="FLOOD_RATE_VIOLATION" if flood else "",
-            xai_summary=xai_report.summary_text if xai_report else f"CUSUM={cusum_res.score:.2f}",
+            xai_summary=xai_summary,
+            behavioral_transition_summary=transition_observation.explanation,
             protocol_version=protocol_version,
             boot_id=boot_id,
             sequence=sequence,

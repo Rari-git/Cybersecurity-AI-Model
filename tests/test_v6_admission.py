@@ -81,6 +81,28 @@ def test_v6_admission_rejects_duplicate_and_out_of_order_sequences_before_normal
         incidents.close()
 
 
+def test_v5_normal_event_integrity_metadata_binds_canonical_payload(gate_storage):
+    storage, gate = gate_storage
+    raw_payload = b"00351.250"
+
+    result = gate.evaluate_and_ingest(_ctx(), GAS_TOPIC, raw_payload)
+
+    assert result.admitted is True
+    assert result.canonical_text == "351.25"
+    normal = storage.connect_readonly("normal")
+    try:
+        row = normal.execute(
+            "SELECT payload_len,payload_sha256,raw_payload FROM raw_events WHERE session_id=?",
+            ("v6-live",),
+        ).fetchone()
+    finally:
+        normal.close()
+    canonical = result.canonical_text.encode("utf-8")
+    assert row["raw_payload"] == result.canonical_text
+    assert row["payload_len"] == len(canonical)
+    assert row["payload_sha256"] == hashlib.sha256(canonical).digest()
+
+
 def test_v6_admission_rejects_stale_and_invalid_boot_ids_as_incidents(gate_storage):
     storage, gate = gate_storage
     ctx = _ctx()

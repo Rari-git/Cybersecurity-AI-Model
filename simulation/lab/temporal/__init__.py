@@ -16,6 +16,7 @@ from simulation.lab.temporal.transition_profile import (
     CLEAN_TRANSITION_PROFILE_SCHEMA,
     TransitionProfileError,
     build_clean_transition_profile,
+    evaluate_clean_transition_profile,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "CLEAN_TRANSITION_PROFILE_SCHEMA",
     "TransitionProfileError",
     "build_clean_transition_profile",
+    "evaluate_clean_transition_profile",
 ]

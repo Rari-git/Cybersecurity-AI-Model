@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 from collections import Counter, defaultdict
@@ -315,3 +316,198 @@ def build_clean_transition_profile(
     }
     profile["profile_sha256"] = _digest(profile, "profile_sha256")
     return profile
+
+
+def evaluate_clean_transition_profile(
+    profile: Mapping[str, Any],
+    storage: Any,
+    validation_session_ids: Iterable[str],
+    curation_digests: Mapping[str, str],
+) -> dict[str, Any]:
+    """Measure profile coverage on the complete, disjoint validation partition.
+
+    This reports observed state/transition coverage only. Unseen items are not
+    called attacks or faults, and the profile is never modified. Held-out
+    sessions are rejected so they remain available for a later frozen check.
+    """
+    if not isinstance(profile, Mapping) or profile.get("schema_version") != CLEAN_TRANSITION_PROFILE_SCHEMA:
+        raise TransitionProfileError("unsupported clean transition profile schema")
+    supplied_digest = profile.get("profile_sha256")
+    if (not isinstance(supplied_digest, str) or len(supplied_digest) != 64
+            or any(char not in _SHA256_HEX for char in supplied_digest.lower())
+            or not hmac.compare_digest(_digest(profile, "profile_sha256"), supplied_digest.lower())):
+        raise TransitionProfileError("profile digest verification failed")
+
+    source = profile.get("source")
+    if not isinstance(source, Mapping):
+        raise TransitionProfileError("profile source provenance is missing")
+    split = source.get("capture_run_split")
+    if not isinstance(split, Mapping):
+        raise TransitionProfileError("profile capture-run split provenance is missing")
+    permitted_ids = split.get("validation_session_ids")
+    if (not isinstance(permitted_ids, list) or not permitted_ids
+            or any(not isinstance(item, str) or not item for item in permitted_ids)
+            or len(set(permitted_ids)) != len(permitted_ids)):
+        raise TransitionProfileError("profile validation session IDs are invalid")
+    if isinstance(validation_session_ids, (str, bytes)):
+        raise TransitionProfileError("validation_session_ids must be an iterable, not a string")
+    requested = list(validation_session_ids)
+    if (not requested or any(not isinstance(item, str) or not item for item in requested)
+            or len(set(requested)) != len(requested)):
+        raise TransitionProfileError("validation_session_ids must be non-empty and unique")
+    ordered_ids = sorted(requested)
+    if set(ordered_ids) != set(permitted_ids):
+        raise TransitionProfileError("evaluation must use the complete validation partition only")
+    if not isinstance(curation_digests, Mapping) or set(curation_digests) != set(ordered_ids):
+        raise TransitionProfileError("validation curation digests must exactly match the validation partition")
+    digests = {}
+    for session_id in ordered_ids:
+        digest = curation_digests[session_id]
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(char not in _SHA256_HEX for char in digest.lower())):
+            raise TransitionProfileError(f"validation curation digest is invalid: {session_id}")
+        digests[session_id] = digest.lower()
+
+    configuration = profile.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise TransitionProfileError("profile configuration is missing")
+    rapid = _finite_non_negative(configuration.get("rapid_interval_seconds"), "rapid_interval_seconds")
+    normal = _finite_non_negative(configuration.get("normal_interval_seconds"), "normal_interval_seconds")
+    if rapid <= 0 or normal <= rapid:
+        raise TransitionProfileError("profile interval thresholds are invalid")
+
+    state_rows = profile.get("states")
+    transition_rows = profile.get("transitions")
+    if not isinstance(state_rows, list) or not isinstance(transition_rows, list):
+        raise TransitionProfileError("profile states or transitions are malformed")
+    known_states: set[str] = set()
+    for item in state_rows:
+        if not isinstance(item, Mapping) or not isinstance(item.get("descriptor"), Mapping):
+            raise TransitionProfileError("profile state record is malformed")
+        state_id = item.get("state_id")
+        descriptor = dict(item["descriptor"])
+        if not isinstance(state_id, str) or state_id != _state_id(descriptor) or state_id in known_states:
+            raise TransitionProfileError("profile state identity is invalid or duplicated")
+        known_states.add(state_id)
+
+    known_transitions: dict[tuple[str, str, str], float] = {}
+    probability_sums: Counter[str] = Counter()
+    for item in transition_rows:
+        if not isinstance(item, Mapping):
+            raise TransitionProfileError("profile transition record is malformed")
+        edge = (item.get("from_state_id"), item.get("to_state_id"), item.get("inter_arrival_class"))
+        if (edge[0] not in known_states or edge[1] not in known_states
+                or edge[2] not in {"simultaneous", "rapid", "normal", "delayed"}
+                or edge in known_transitions):
+            raise TransitionProfileError("profile transition identity is invalid or duplicated")
+        count = _integer(item.get("count"), "transition count", 1)
+        probability = _finite_non_negative(item.get("outgoing_probability"), "outgoing_probability")
+        if probability <= 0 or probability > 1:
+            raise TransitionProfileError("profile transition probability is outside (0, 1]")
+        known_transitions[edge] = probability
+        probability_sums[edge[0]] += probability
+    if any(not math.isclose(value, 1.0, rel_tol=1e-9, abs_tol=1e-9)
+           for value in probability_sums.values()):
+        raise TransitionProfileError("profile outgoing transition probabilities do not sum to one")
+
+    # Read only the validation partition and re-check its clean curation evidence.
+    rows_by_session = load_verified_clean_session_rows(storage, ordered_ids, digests)
+    if not isinstance(rows_by_session, Mapping) or set(rows_by_session) != set(ordered_ids):
+        raise TransitionProfileError("clean-session verifier returned an unexpected validation session set")
+
+    session_results = []
+    total_events = total_known_states = 0
+    total_transitions = total_known_transitions = 0
+    known_surprisal_bits = []
+    for session_id in ordered_ids:
+        streams = _session_streams(rows_by_session[session_id], session_id)
+        event_count = known_state_count = transition_count = known_transition_count = 0
+        unseen_state_ids: set[str] = set()
+        unseen_edges: set[tuple[str, str, str]] = set()
+        for stream_key in sorted(streams):
+            records = sorted(streams[stream_key], key=lambda record: record[0])
+            if len({record[0] for record in records}) != len(records):
+                raise TransitionProfileError(f"duplicate event IDs in validation stream: {session_id}")
+            previous_state: str | None = None
+            previous_timestamp: int | None = None
+            for _event_id, timestamp, payload_len in records:
+                if previous_timestamp is not None and timestamp < previous_timestamp:
+                    raise TransitionProfileError(
+                        f"gateway timestamp moved backwards within validation stream: {session_id}"
+                    )
+                device_id, generation, topic = stream_key
+                descriptor = {
+                    "device_id": device_id,
+                    "generation": generation,
+                    "topic": topic,
+                    "payload_size_bucket": _payload_bucket(payload_len),
+                }
+                current_state = _state_id(descriptor)
+                event_count += 1
+                if current_state in known_states:
+                    known_state_count += 1
+                else:
+                    unseen_state_ids.add(current_state)
+                if previous_state is not None and previous_timestamp is not None:
+                    elapsed = (timestamp - previous_timestamp) / 1_000_000_000.0
+                    edge = (previous_state, current_state, _interval_class(elapsed, rapid, normal))
+                    transition_count += 1
+                    probability = known_transitions.get(edge)
+                    if probability is None:
+                        unseen_edges.add(edge)
+                    else:
+                        known_transition_count += 1
+                        known_surprisal_bits.append(-math.log2(probability))
+                previous_state = current_state
+                previous_timestamp = timestamp
+
+        total_events += event_count
+        total_known_states += known_state_count
+        total_transitions += transition_count
+        total_known_transitions += known_transition_count
+        session_results.append({
+            "session_id": session_id,
+            "dataset_sha256": digests[session_id],
+            "event_count": event_count,
+            "known_state_event_count": known_state_count,
+            "state_coverage_rate": known_state_count / event_count if event_count else 0.0,
+            "unique_unseen_state_count": len(unseen_state_ids),
+            "transition_count": transition_count,
+            "known_transition_count": known_transition_count,
+            "transition_coverage_rate": known_transition_count / transition_count if transition_count else 0.0,
+            "unique_unseen_transition_count": len(unseen_edges),
+        })
+
+    result: dict[str, Any] = {
+        "schema_version": "c3.clean-transition-validation.v1",
+        "source": {
+            "profile_sha256": supplied_digest,
+            "evaluation_partition": "validation",
+            "session_curation_digests": [
+                {"session_id": session_id, "dataset_sha256": digests[session_id]}
+                for session_id in ordered_ids
+            ],
+        },
+        "summary": {
+            "validation_session_count": len(ordered_ids),
+            "event_count": total_events,
+            "known_state_event_count": total_known_states,
+            "state_coverage_rate": total_known_states / total_events if total_events else 0.0,
+            "transition_count": total_transitions,
+            "known_transition_count": total_known_transitions,
+            "transition_coverage_rate": total_known_transitions / total_transitions if total_transitions else 0.0,
+            "known_transition_mean_surprisal_bits": (
+                sum(known_surprisal_bits) / len(known_surprisal_bits) if known_surprisal_bits else None
+            ),
+        },
+        "sessions": session_results,
+        "interpretation": {
+            "analysis_type": "descriptive_validation_coverage",
+            "unseen_behavior_is_not_an_attack_verdict": True,
+            "anomaly_score_generated": False,
+            "profile_updated": False,
+            "policy_changed": False,
+        },
+    }
+    result["validation_sha256"] = _digest(result, "validation_sha256")
+    return result

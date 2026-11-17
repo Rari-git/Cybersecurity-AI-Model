@@ -148,6 +148,12 @@ class AdmissionGate:
             )
             return AdmissionResult(False, device_id, generation, reason, numeric_value=num_val)
 
+        # Normal telemetry stores the parser's canonical scalar. Bind the
+        # stored length and digest to that exact representation so dataset
+        # integrity checks and runtime feature extraction see identical bytes.
+        canonical_bytes = parsed.canonical_text.encode("utf-8", errors="strict")
+        canonical_sha = hashlib.sha256(canonical_bytes).digest()
+
         # Admis în telemetry_normal.db
         persist_normal_event(
             self.storage,
@@ -160,8 +166,8 @@ class AdmissionGate:
                 topic,
                 gateway_ts_ns,
                 device_ts_ns,
-                len(raw_bytes),
-                payload_sha,
+                len(canonical_bytes),
+                canonical_sha,
                 num_val,
                 parsed.canonical_text,
                 ctx.source_type,
